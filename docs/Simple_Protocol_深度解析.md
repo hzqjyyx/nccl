@@ -94,260 +94,121 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 
 ---
 
-## 三、任务排队：精心设计的调度系统
+## 三、Simple Protocol 的调度入口
 
-### ncclEnqueueCheck：不只是简单的验证
+### 3.1 从 API 到调度系统
 
-进入 `ncclEnqueueCheck` 函数（[enqueue.cc:2620-2650](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2620-L2650)），它做的事情远比函数名暗示的要多：
-
-1. **合法性检查**：验证指针、communicator 状态
-2. **任务入队**：调用 `taskAppend` 把操作加入规划器
-3. **触发执行**：如果不在 group 模式，立即调用 `ncclGroupEndInternal` 启动执行
-
-其中最关键的是第二步 —— 把任务放入 planner。
-
-### collTaskAppend：任务分配与按流量排序
-
-深入 `collTaskAppend` 函数（[enqueue.cc:2453-2495](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2453-L2495)），核心逻辑分为三步：
-
-#### 步骤 1：分配任务结构体
+在第二章我们看到用户调用 `ncclAllReduce`，函数内部会调用 `ncclEnqueueCheck`（[enqueue.cc:2620](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2620)）。这个函数是进入 NCCL 调度系统的入口：
 
 ```c
-// [enqueue.cc:2468](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2468)
-struct ncclTaskColl* t = ncclMemoryPoolAlloc<struct ncclTaskColl>(
-  &comm->memPool_ncclTaskColl, &comm->memPermanent);
-```
-
-从 communicator 的内存池中分配任务对象，使用持久内存（`memPermanent`）避免频繁分配。
-
-#### 步骤 2：填充任务信息
-
-```c
-// [enqueue.cc:2469-2488](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2469-L2488)
-t->func = info->coll;
-t->sendbuff = info->sendbuff;
-t->recvbuff = info->recvbuff;
-t->count = info->count;
-t->datatype = info->datatype;
-// ... 更多字段 ...
-
-// 关键：计算流量字节数，用于后续排序
-t->trafficBytes = t->count * elementSize * ncclFuncTrafficPerByte(t->func, comm->nRanks);
-```
-
-`trafficBytes` 的计算非常关键，它反映了这个操作的通信量大小，会用于调度器的排序决策。
-
-#### 步骤 3：插入到按流量排序的桶排序器
-
-```c
-// [enqueue.cc:2491](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2491)
-planner->nTasksColl += 1;
-ncclTaskCollSorterInsert(&planner->collSorter, t, t->trafficBytes);
-```
-
-注意这里不是简单的 FIFO 队列入队，而是**按流量大小插入桶排序器**！
-
-### collSorter：按流量排序的智能桶排序器
-
-`collSorter` 的真实类型是 `ncclTaskCollSorter`（[comm.h:299-359](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/comm.h#L299-L359)），这是一个精妙的数据结构：
-
-```c
-struct ncclTaskCollSorter {
-  static constexpr int UnitLog2 = 10;           // 1KB 单位
-  static constexpr size_t UnitSize = 1<<10;     // 1024 字节
-  static constexpr int MaxLog2 = 30;            // 1GB 最大值
-  static constexpr size_t MaxSize = 1ull<<30;
-  static constexpr int BitsPerPow2 = 2;         // 每个2次幂间有4个桶
-  static constexpr int BinsPerPow2 = 1<<2;      // 4个桶
-  static constexpr int BinCount = 1 + (30-10)*4; // 总共 81 个桶
-
-  struct ncclTaskColl* head;
-  struct ncclTaskColl* tail;
-  int binEdge;  // 第一个空桶的索引
-  struct ncclTaskColl** bins[BinCount];  // 桶指针数组
-};
-```
-
-#### 工作原理
-
-**1. 桶的分布**（对数级分桶）：
-- 1KB - 2KB：4个桶
-- 2KB - 4KB：4个桶
-- 4KB - 8KB：4个桶
-- ...
-- 512MB - 1GB：4个桶
-
-**2. 插入策略**（[comm.h:319-348](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/comm.h#L319-L348)）：
-
-```c
-inline void ncclTaskCollSorterInsert(
-    struct ncclTaskCollSorter* me, struct ncclTaskColl* x, size_t size) {
-  // 根据流量大小编码到桶索引
-  int bin = u32fpEncode(std::min(MaxSize, size)>>UnitLog2, BitsPerPow2);
-  bin = BinCount-1 - bin;  // 降序：大任务在前
-
-  // ... 插入到对应桶的头部（O(1) 操作） ...
+ncclResult_t ncclAllReduce(...) {
+  struct ncclInfo info = { ncclFuncAllReduce, "AllReduce", ... };
+  return ncclEnqueueCheck(&info);  // ← 进入调度系统
 }
 ```
 
-**3. 取出策略**：`ncclTaskCollSorterDequeueAll` 一次性取出所有任务（已按流量降序排列）。
+`ncclEnqueueCheck` 做三件事：
+1. **合法性检查**：验证参数、communicator 状态
+2. **任务入队**：调用 `taskAppend` 把操作加入 Planner
+3. **触发执行**：调用 `ncclGroupEndInternal` 启动执行（如果不在 Group 中）
 
-#### 为什么大任务优先？
+### 3.2 任务入队与流量计算
 
-假设有 3 个任务到达：
-- 任务 A：1GB AllReduce（需要 100ms）
-- 任务 B：100MB AllReduce（需要 10ms）
-- 任务 C：10MB AllReduce（需要 1ms）
-
-**按到达顺序 B → C → A**：
-```
-T0----T10--T11-----------T111
-   B    C        A
-总完成时间 = 111ms
-```
-
-**按流量降序 A → B → C**（collSorter 的策略）：
-```
-T0-----------------T100--T110-T111
-         A            B    C
-总完成时间 = 111ms（相同）
-
-但优势在于：
-1. 大任务更早占用高带宽通道
-2. 小任务可在大任务执行时利用空闲资源（不同通道）
-3. 多通道并行时，大任务先启动能更好地填充流水线
-4. 减少大任务的总等待时间，优化尾延迟
-```
-
-#### 近似排序的智慧
-
-注意 `BitsPerPow2 = 2`，每个 2 次幂之间有 4 个桶，这意味着：
-- **最坏情况的乱序幅度**：(5/4)-1 = 25%
-- **插入复杂度**：O(1)
-- **空间开销**：81 个指针
-
-这是**性能与精度的权衡**：
-- 完全精确排序需要堆（O(log N)插入）或排序（O(N log N)）
-- 桶排序在 O(1) 时间内完成插入
-- 25% 的误差对调度影响很小，但节省了大量计算
-
-**关键洞察：用户看到的是简单的 API 调用，NCCL 看到的是全局的资源调度问题。Planner 不是简单的 FIFO，而是流量感知的智能调度器。**
-
-### 任务类型：kernel-based vs Copy Engine ⚡
-
-在任务入队时，NCCL 会根据条件选择两种不同的执行路径：
-
-#### 1. 标准路径：collTaskAppend（kernel-based）
-
-这是传统的执行路径，使用 **CUDA kernel** 完成通信：
+任务通过 `collTaskAppend` 函数进入 Planner（[enqueue.cc:2453-2495](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2453-2495)）：
 
 ```c
-// [enqueue.cc:2611](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2611)
-NCCLCHECK(collTaskAppend(comm, info, opDev));
-```
+static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info, ...) {
+  struct ncclTaskColl* t = ncclMemoryPoolAlloc<struct ncclTaskColl>(...);
 
-- 启动 GPU kernel（由 CUDA thread blocks 执行）
-- 通过 `Primitives` 类实现数据传输
-- 支持所有协议（Simple/LL/LL128）
-- 支持所有集合操作（AllReduce, AllGather, ReduceScatter 等）
-- 适用于所有场景（单节点、多节点、任意拓扑）
+  // 填充任务信息
+  t->func = info->coll;         // ncclFuncAllReduce
+  t->count = info->count;       // 元素数量
+  t->datatype = info->datatype; // 数据类型
 
-#### 2. 优化路径：ceCollTaskAppend（Copy Engine）
+  // ← 关键：计算流量字节数
+  t->trafficBytes = t->count * elementSize * ncclFuncTrafficPerByte(t->func, comm->nRanks);
 
-这是 NCCL 2.27+ 引入的新路径，使用 **GPU 硬件 Copy Engine** 执行通信：
+  // 插入到 Planner 的桶排序器（按流量大小排序）
+  ncclTaskCollSorterInsert(&planner->collSorter, t, t->trafficBytes);
 
-```c
-// [enqueue.cc:2581](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2581)
-NCCLCHECK(ceCollTaskAppend(comm, info, sendWin, recvWin, opDev));
-```
-
-**Copy Engine 的启用条件**（[enqueue.cc:2580](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/enqueue.cc#L2580)）：
-
-```c
-if (comm->symmetricSupport &&           // ✅ 支持对称内存
-    comm->nNodes == 1 &&                 // ✅ 单节点（GPU 在同一台机器）
-    sendWin && recvWin &&                // ✅ 有注册的内存窗口
-    (sendWin->winFlags & recvWin->winFlags & NCCL_WIN_COLL_SYMMETRIC) &&  // ✅ 对称窗口
-    comm->config.CTAPolicy == NCCL_CTA_POLICY_ZERO &&  // ✅ 零 CTA 策略
-    ceImplemented) {                     // ✅ CE 实现了这个操作
-
-  // 使用 Copy Engine 路径
-  NCCLCHECK(ceCollTaskAppend(comm, info, sendWin, recvWin, opDev));
-} else {
-  // 回退到标准 kernel 路径
-  NCCLCHECK(collTaskAppend(comm, info, opDev));
+  return ncclSuccess;
 }
 ```
 
-**Copy Engine 支持的操作**（[ce_coll.cc:82-95](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/ce_coll.cc#L82-L95)）：
+**trafficBytes 的计算**：
 
-```c
-bool ncclCeImplemented(ncclFunc_t coll, int red, ncclDataType_t ty) {
-  if (driverVersion >= 12050) {  // 需要 CUDA 12.5+
-    switch (coll) {
-    case ncclFuncAllGather:   // ✅ 支持
-    case ncclFuncAlltoAll:    // ✅ 支持
-    case ncclFuncScatter:     // ✅ 支持
-    case ncclFuncGather:      // ✅ 支持
-      return true;
-    default:
-      return false;  // ❌ AllReduce、ReduceScatter 等需要归约的操作不支持
-    }
-  }
-  return false;
-}
+对于 Ring AllReduce，`ncclFuncTrafficPerByte` 返回 2.0（因为每个 GPU 需要发送和接收总数据量的 2 倍）：
+
+```
+示例：1GB AllReduce（8 GPU，Ring 算法）
+  - count = 256M (1GB / 4 bytes)
+  - elementSize = 4 (float32)
+  - trafficBytes = 256M × 4 × 2.0 = 2GB
+
+这意味着整个 Ring 通信过程总共需要传输 2GB 的数据。
 ```
 
-**为什么 CE 不支持 AllReduce？**
+### 3.3 Simple Protocol 在调度中的优势
 
-Copy Engine 是 GPU 的 **DMA（Direct Memory Access）引擎**，只能做**数据移动**（memcpy），不能做**计算**（reduction）。AllReduce 需要对数据求和/求最大值等归约操作，必须用 CUDA 核心计算，因此只能走 kernel 路径。
+**为什么 Simple Protocol 的任务容易排在前面？**
 
-#### Copy Engine 的核心优势
+因为 Simple Protocol 通常用于大数据量场景，而 NCCL 的 Planner 使用**流量优先排序**（大任务优先）：
 
-从 [ce_coll.h:18-28](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/ce_coll.h#L18-L28) 可以看到 CE 的同步机制：
-
-```c
-struct ncclCeColl {
-  uint8_t* baseUCSymReadyPtr;    // Ready 标志位（同步用）
-  uint8_t* baseUCSymComplPtr;    // Complete 标志位（同步用）
-  uint32_t ceSeqNum;              // 序列号
-  bool useCompletePtr;            // 双缓冲切换
-  struct ncclDevrWindow* ceSyncWin;  // 对称内存窗口
-};
+```
+任务队列（按 trafficBytes 降序）：
+1. [2GB AllReduce, Simple]  ← Simple Protocol，大数据量
+2. [500MB AllReduce, Simple]
+3. [100MB AllGather, Simple]
+4. [10MB AllReduce, LL128]  ← LL128，中等数据量
+5. [1MB AllReduce, LL]      ← LL，小数据量
 ```
 
-**优势对比**：
+**Simple Protocol 在调度中的特点**：
 
-| 特性 | **kernel-based (coll)** | **Copy Engine (ceColl)** |
-|------|-------------------------|--------------------------|
-| 实现方式 | CUDA kernel | GPU DMA 硬件 |
-| kernel 启动开销 | 有（~5-10μs） | 无 |
-| CPU 参与 | 需要（启动kernel） | 不需要（纯硬件） |
-| 适用场景 | 所有场景 | 单节点 + 对称内存 + 无归约 |
-| 支持操作 | 全部 | AllGather, AlltoAll, Scatter, Gather |
-| 驱动要求 | 任意 | CUDA 12.5+ |
-| 典型延迟 | 15-20μs | 8-12μs |
+1. **高 trafficBytes**：大数据量 → 排序靠前 → 优先执行
+2. **更容易聚合**：NCCL 会聚合 4X 以内的相似任务，Simple 的任务通常规模相近
+3. **占用更多通道**：大任务需要更多通道并行，能更好地利用 GPU 资源
+4. **协议选择稳定**：对于 1GB+ 的数据，成本模型几乎总是选择 Simple
 
-**实际案例**：
+### 3.4 完整的调度流程（简要）
 
-假设你在 8-GPU DGX 服务器上运行 AllGather：
+```mermaid
+flowchart TD
+    A[ncclAllReduce API] --> B[ncclEnqueueCheck]
+    B --> C[taskAppend: 任务入队]
+    C --> D[collTaskAppend: 计算 trafficBytes]
+    D --> E[collSorter: 按流量排序]
+    E --> F[ncclGroupEndInternal: 触发执行]
+    F --> G[ncclPrepareTasks: 准备任务]
+    G --> H[算法和协议选择]
+    H --> I{数据量?}
+    I -->|大| J[Simple Protocol]
+    I -->|中| K[LL128 Protocol]
+    I -->|小| L[LL Protocol]
+    J --> M[Scheduler: 生成 Kernel Plan]
+    K --> M
+    L --> M
+    M --> N[CUDA Kernel 执行]
 
-```python
-import torch.distributed as dist
-
-# 使用对称内存（NCCL 2.27+ 的 User Buffer Registration API）
-sendbuf = torch.zeros(1024, device='cuda')
-recvbuf = torch.zeros(8 * 1024, device='cuda')
-
-# NCCL 内部决策：
-# 1. 检查：单节点 ✅、NVLink ✅、对称内存 ✅、AllGather ✅
-# 2. 选择 CE 路径 → 调用 ceCollTaskAppend
-# 3. 使用 cuMemcpy 的硬件加速版本（不启动 kernel）
-# 4. 延迟降低 40-50%
-dist.all_gather_into_tensor(recvbuf, sendbuf)
+    style J fill:#9f9
+    style E fill:#ff9
 ```
 
-**关键洞察：NCCL 会自动选择最优路径，用户无需关心底层是 kernel 还是 Copy Engine。这种自适应优化是 NCCL 性能领先的重要原因之一。**
+**关键洞察：Simple Protocol 的大数据量特性让它在调度系统中自然获得优先级。NCCL 的"大任务优先"策略与 Simple Protocol 的"带宽优先"设计相得益彰，确保大规模通信能够快速占用资源、充分利用带宽。**
+
+### 3.5 深入理解 NCCL 调度系统
+
+本章只是简要介绍了 Simple Protocol 如何进入调度系统。如果你想深入理解 NCCL 的完整调度机制，包括：
+
+- **操作聚合（Operation Aggregation）**：如何使用 Group API 聚合多个操作
+- **collSorter 的详细实现**：81 个桶的对数级分桶策略
+- **任务聚合（4X 规则）**：如何合并相似大小的任务
+- **成本模型驱动的算法选择**：为什么大数据量选择 Simple
+- **调度器与 Kernel Plan**：如何分配通道和生成执行计划
+
+请参考：**[NCCL_调度系统深度解析.md](NCCL_调度系统深度解析.md)**
+
+该文档详细讲解了从 API 调用到 Kernel 执行的完整流程，涵盖 Planner、Scheduler、Group API、阻塞/非阻塞模式等核心概念，并提供了丰富的实战案例。
 
 ---
 

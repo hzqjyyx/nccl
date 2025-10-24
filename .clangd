@@ -5,4 +5,5 @@ CompileFlags:
     - "-I/usr/include/x86_64-linux-gnu/c++/11"
     - "-I/workspace/nccl/src/include"
     - "-I/workspace/nccl/src/include/plugin"
-    - "-I/usr/local/cuda-12/include/"
+    - "-I/workspace/nccl/src/device"
+    - "-I/usr/local/cuda-12/include"
