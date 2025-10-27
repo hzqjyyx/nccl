@@ -3,8 +3,8 @@
 ## 整体结构
 
 文档分为两个层次：
-- **概念系列**（01-05）：理解"是什么"和"为什么"，建立整体认知
-- **代码系列**（06-10）：理解"怎么做"，逐行分析实现
+- **概念系列**（01-06）：理解"是什么"和"为什么"，建立整体认知
+- **代码系列**（07-11）：理解"怎么做"，逐行分析实现
 
 **目标读者假设**：
 - 了解基本的 GPU 编程（CUDA）
@@ -19,7 +19,7 @@
 
 ---
 
-## 第一层：概念系列（01-05）
+## 第一层：概念系列（01-06）
 
 ### 文档 01: Simple Protocol 概览 ✅
 
@@ -41,7 +41,6 @@
 3. 核心机制概览
    - 环形缓冲区
    - 流控计数器
-4. 端到端例子
 5. 总结
 
 **关键洞察**：
@@ -51,7 +50,7 @@
 
 ---
 
-### 文档 02: 数据结构详解（修订版）
+### 文档 02: 数据结构详解
 
 **目标**：理解 Device 侧的关键数据结构及其内存语义
 
@@ -409,7 +408,7 @@ Write data to slot 1         |
 
 ---
 
-### 文档 05: GenericOp 工作流程（增强版）
+### 文档 05: GenericOp 工作流程
 
 **目标**：理解一次完整的数据传输操作
 
@@ -539,9 +538,168 @@ while (slice < SlicePerChunk) {
 
 ---
 
-## 第二层：代码深潜系列（06-10）
+### 文档 06: Ring AllReduce 端到端流程
 
-### 文档 06: Primitives 构造与初始化
+**目标**：串联文档02-05的概念，理解它们如何服务于真实的AllReduce场景
+
+**核心问题**：
+- Ring AllReduce的算法逻辑是什么？
+- Reduce-Scatter和AllGather如何映射到Simple Protocol？
+- 4个GPU如何流水线协同？
+- 数据在不同GPU和buffer之间如何流动？
+- 为什么8个slot刚好够用？
+
+**内容结构**：
+
+#### 6.1 Ring AllReduce算法回顾
+- **问题定义**：4个GPU，每个有数据，如何都得到sum？
+- **朴素方案的问题**：all-to-all，复杂度O(n²)
+- **Ring方案**：
+  - Reduce-Scatter阶段：分而治之，每个GPU负责reduce一部分
+  - AllGather阶段：收集所有reduce后的部分
+  - 复杂度：O(n)，流水线并行
+- **为什么选Ring**：简单、高效、带宽最优
+
+#### 6.2 场景设定
+- 4个GPU，Ring拓扑
+- 4个channel（典型配置）
+- bf16数据类型，256MB/GPU
+- 从`ncclKernel<<<...>>>`启动后开始分析
+
+#### 6.3 数据分片和角色分配
+- **Channel分片**：256MB -> 4个channel，每个64MB
+- **Chunk分片**：每个channel内再分4个chunk，每个16MB
+- **角色分配**：
+  - Reduce-Scatter: GPU i负责reduce chunk i
+  - AllGather: GPU i广播自己的chunk i
+- **为什么这样分**：负载均衡 + 流水线
+
+#### 6.4 Reduce-Scatter阶段的详细流程
+
+##### 6.4.1 算法逻辑
+- 4步，每步每个GPU：
+  - 向下游发送一个chunk
+  - 从上游接收一个chunk，**做reduce**
+- 每步处理的chunk不同（轮转）
+- 完成后：每个GPU有1个fully reduced chunk
+
+##### 6.4.2 映射到Simple Protocol
+- **调用链**：
+  ```
+  runRing<AllReduce>() -> Primitives::recvReduceSend()
+    -> genericOp<Recv=true, Send=true, ...>()
+  ```
+- **每一步**：
+  - waitPeer (接收方等数据，发送方等slot空闲)
+  - reduceCopy (接收+reduce，发送)
+  - postPeer (更新计数器)
+- **环形缓冲区使用**：Step 0用slot 0，Step 1用slot 1...
+- **代码位置**：`device/all_reduce.h`, `device/prims_simple.h`
+
+##### 6.4.3 一个Step的微观流程
+- 以Step 0，GPU 1为例（同时发送和接收）
+- **接收侧**：
+  - 从GPU 0接收chunk 0
+  - 读取GPU0写入的ringbuffer[slot0]
+  - 读取本地sendbuff[chunk0]
+  - reduce (bf16加法)
+  - 写入recvbuff[chunk0]
+- **发送侧**：
+  - 向GPU 2发送chunk 1
+  - 读取本地sendbuff[chunk1]
+  - 写入GPU2.ringbuffer[slot0]
+  - fence + 更新tail
+- **串联文档04**：waitPeer/postPeer在这里的具体作用
+
+##### 6.4.4 4个GPU的时序图
+- 展示Step 0的并行执行
+- 4个GPU同时发送+接收
+- 流水线效果：发送和接收错开
+
+#### 6.5 AllGather阶段的详细流程
+
+##### 6.5.1 算法逻辑
+- 4步，每步每个GPU：
+  - 向下游发送reduced chunk
+  - 从上游接收reduced chunk，**直接copy**（无reduce）
+- 完成后：每个GPU有完整的4个reduced chunk
+
+##### 6.5.2 映射到Simple Protocol
+- **调用链**：`Primitives::recvCopySend()`
+- **与Reduce-Scatter的差异**：
+  - 代码：`recvReduceSend` vs `recvCopySend`
+  - 操作：reduce vs copy
+  - 数据源：sendbuff vs recvbuff（上阶段结果）
+
+##### 6.5.3 环形缓冲区的复用
+- **关键问题**：为什么可以复用同一个ring buffer？
+- Reduce-Scatter用slot 0-3
+- AllGather用slot 4-7（继续递增）
+- **为什么不冲突**：
+  - slot 0-3已经被读走（head更新了）
+  - 8个slot刚好够：4 + 4
+- **串联文档03**：这就是为什么NCCL_STEPS=8
+
+#### 6.6 数据流动的完整视角
+
+##### 6.6.1 追踪一个chunk的生命周期
+- 以GPU 1的chunk 1为例
+- **初始**：GPU1.sendbuff[chunk1]
+- **RS Step 0**：GPU1 -> GPU2.ringbuffer[slot0] -> GPU2.recvbuff[chunk1]
+- **RS Step 1**：GPU2 -> GPU3.ringbuffer[slot1] -> GPU3.recvbuff[chunk1] (reduce)
+- **RS Step 2-3**：继续传递reduce
+- **RS完成**：GPU1.recvbuff[chunk1]是fully reduced
+- **AG Step 0-3**：GPU1广播chunk1给所有GPU
+- **AG完成**：所有GPU的recvbuff[chunk1]都是sum
+
+##### 6.6.2 内存层次
+- **User buffer** (sendbuff/recvbuff)：起点和终点
+- **Ring buffer**：临时中转站
+- **为什么需要中转**：解耦发送和接收，支持流水线
+
+#### 6.7 多channel的并行
+- 4个channel = 4个block
+- 同时执行上述流程
+- 处理不同的数据offset
+- 互不干扰，4倍吞吐
+
+#### 6.8 两层流水线的理解
+- **GPU级流水线**（Ring算法）：
+  - 4个GPU错开工作
+  - 总时间 ≈ 2*(n-1)*chunk_time，而非 n²*chunk_time
+- **Step级流水线**（Simple Protocol）：
+  - 8个slot让发送方和接收方错开
+  - 避免等待，保持带宽
+- **两层配合**：算法层和协议层解耦
+
+#### 6.9 概念串联总结
+回顾文档02-05的核心概念：
+
+| 文档 | 核心概念 | 在Ring AllReduce中的体现 |
+|------|---------|------------------------|
+| 02 | ncclConnInfo指针 | send conn写下游buffer，recv conn读本地buffer |
+| 03 | 8个slot的环形缓冲区 | 支持RS(4步)+AG(4步)，可复用 |
+| 04 | waitPeer/postPeer流控 | 每步同步发送方和接收方 |
+| 05 | genericOp主循环 | RS和AG都调用它，参数不同 |
+
+**关键洞察**：
+- Ring AllReduce只是Simple Protocol的一个**应用**
+- 同一套Primitives可支持不同算法（Ring, Tree, CollNet...）
+- 算法决定"做什么"，协议决定"怎么做"
+- 8个slot是经验值，刚好够常见算法使用
+
+**代码位置**：
+- Ring AllReduce入口：`device/all_reduce.h`
+- Primitives调用：`device/prims_simple.h`
+- recvReduceSend vs recvCopySend：`device/prims_simple.h`
+
+**预计篇幅**：700-900行
+
+---
+
+## 第二层：代码深潜系列（07-11）
+
+### 文档 07: Primitives 构造与初始化
 
 **目标**：逐行理解 Primitives 对象的创建
 
@@ -560,7 +718,7 @@ while (slice < SlicePerChunk) {
 
 ---
 
-### 文档 07: waitPeer 代码剖析
+### 文档 08: waitPeer 代码剖析
 
 **目标**：逐行理解 waitPeer 的实现
 
@@ -580,7 +738,7 @@ while (slice < SlicePerChunk) {
 
 ---
 
-### 文档 08: postPeer 代码剖析
+### 文档 09: postPeer 代码剖析
 
 **目标**：逐行理解 postPeer 的实现
 
@@ -597,7 +755,7 @@ while (slice < SlicePerChunk) {
 
 ---
 
-### 文档 09: genericOp 代码剖析（上）- 循环结构
+### 文档 10: genericOp 代码剖析（上）- 循环结构
 
 **目标**：理解 genericOp 的整体结构
 
@@ -614,7 +772,7 @@ while (slice < SlicePerChunk) {
 
 ---
 
-### 文档 10: genericOp 代码剖析（下）- 数据拷贝
+### 文档 11: genericOp 代码剖析（下）- 数据拷贝
 
 **目标**：理解数据拷贝和优化逻辑
 
@@ -678,15 +836,16 @@ while (slice < SlicePerChunk) {
 ## 进度跟踪
 
 - [x] 文档 01: Simple Protocol 概览
-- [ ] 文档 02: 数据结构详解（修订版）
+- [ ] 文档 02: 数据结构详解
 - [ ] 文档 03: 环形缓冲区机制
-- [ ] 文档 04: 流控机制（修订版）
-- [ ] 文档 05: GenericOp 工作流程（增强版）
-- [ ] 文档 06: Primitives 构造与初始化
-- [ ] 文档 07: waitPeer 代码剖析
-- [ ] 文档 08: postPeer 代码剖析
-- [ ] 文档 09: genericOp 代码剖析（上）
-- [ ] 文档 10: genericOp 代码剖析（下）
+- [ ] 文档 04: 流控机制
+- [ ] 文档 05: GenericOp 工作流程
+- [ ] 文档 06: Ring AllReduce 端到端流程
+- [ ] 文档 07: Primitives 构造与初始化
+- [ ] 文档 08: waitPeer 代码剖析
+- [ ] 文档 09: postPeer 代码剖析
+- [ ] 文档 10: genericOp 代码剖析（上）
+- [ ] 文档 11: genericOp 代码剖析（下）
 
 ---
 
@@ -694,10 +853,10 @@ while (slice < SlicePerChunk) {
 
 如果基础系列完成后，可以考虑：
 
-- **文档 11**: DirectSend/DirectRecv 优化路径
-- **文档 12**: ConnFifo 与 Proxy 通信
-- **文档 13**: NetReg 与网络注册
-- **文档 14**: Pattern Algorithm (PAT) 模式
-- **文档 15**: 多节点通信的完整流程
+- **文档 12**: DirectSend/DirectRecv 优化路径
+- **文档 13**: ConnFifo 与 Proxy 通信
+- **文档 14**: NetReg 与网络注册
+- **文档 15**: Pattern Algorithm (PAT) 模式
+- **文档 16**: 多节点通信的完整流程
 
 但这些都是在基础系列完成、读者充分理解后才适合的扩展内容。
