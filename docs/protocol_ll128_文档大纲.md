@@ -1,4 +1,4 @@
-# LL128 Protocol 文档系列计划（修订版 3）
+# LL128 Protocol 文档系列计划
 
 ## 整体结构
 
@@ -6,7 +6,7 @@
 
 共 **5 个核心文档**：
 - **01**：LL128 Protocol 概览
-- **02**：复用与创新（新增，明确读者需要学什么）
+- **02**：复用与创新
 - **03**：128B行与内存组织
 - **04**：Flag Thread机制（核心创新）
 - **05**：完整流程实例（用具体数值追踪）
@@ -42,7 +42,7 @@
 
 **内容结构**：
 
-### 1.1 为什么需要 LL128？
+### 为什么需要 LL128？
 
 **从应用场景入手**：
 - Tensor Parallel 场景：activations 在层之间传输（中等大小数据）
@@ -53,7 +53,7 @@
   - 延迟敏感：在训练的关键路径上
   - 频繁发生：每个 forward/backward pass 都需要
 
-**Simple 和 LL 的问题**：
+**Simple 和 LL 的问题**（引用 [LL](../protocol_ll/01_概览.md)和[Simple](../protocol_simple/01_概览.md)）：
 - Simple Protocol：
   - 优势：带宽高（接近理论峰值）
   - 问题：启动延迟高，粗粒度同步
@@ -71,7 +71,7 @@
 
 **关键洞察**：中等消息是深度学习训练中最常见的场景之一，需要一个专门优化的协议
 
-### 1.2 LL128 是什么？
+### LL128 是什么？
 
 #### 先说本质
 
@@ -167,26 +167,7 @@ LL128 保持**行级完整性验证**（LL 的优势），同时用 **step 级�
 
 **关键洞察**：LL128 的核心创新是 Flag Thread 机制，它让单标志设计成为可能，从而实现了带宽效率的显著提升
 
-### 1.3 核心概念预览
-
-在深入细节之前，简要预览 LL128 的核心概念（后续文档会详细讲解）：
-
-**Flag Thread**：
-- 定义：`flagThread = (tid % 8) == 7`
-- 职责：负责标志的读写和验证
-- 数量：一个 warp（32 线程）有 4 个 Flag Thread
-
-**128B 行结构**：
-- 16 个 uint64_t = 15 个数据 + 1 个标志
-- 带宽效率：120B / 128B = 93.75%
-
-**两层同步**：
-- 行级：Flag Thread 验证每个 128B 行的标志
-- Step 级：与 LL 相同的 waitSend/postRecv 流控
-
-**关键点**：概览只点到为止，不展示代码细节，留待后续章节详细讲解
-
-### 1.4 LL128 的定位
+### LL128 的定位
 
 **LL128 不是为了取代 Simple 或 LL**，而是填补它们之间的空白。
 
@@ -206,7 +187,7 @@ NCCL 根据消息大小选择协议（具体阈值在 `src/graph/tuning.cc`）�
 
 ---
 
-## 文档 02: 复用与创新
+## 文档 02: 复用与创新（正式文档换个名字）
 
 **目标**：明确告诉读者"LL128 复用了什么，创新了什么"，让读者清楚"我已经知道什么（可以跳过），我需要学什么（重点）"
 
@@ -217,7 +198,7 @@ NCCL 根据消息大小选择协议（具体阈值在 `src/graph/tuning.cc`）�
 
 **内容结构**：
 
-### 2.1 复用 Simple/LL 的概念
+### 复用 Simple/LL 的概念
 
 **这些概念在 Simple/LL 系列已经详细讲解，LL128 直接复用，简要提及即可**
 
@@ -276,7 +257,7 @@ inline __device__ void postSend() {
 
 **关键洞察**：LL128 复用了 Simple/LL 的大部分基础设施，只在传输单元和标志机制上创新
 
-### 2.2 LL128 的创新点
+### LL128 的创新点
 
 **这些是 LL128 独有的内容，是本系列文档的重点**
 
@@ -307,7 +288,7 @@ inline __device__ void postSend() {
 
 **关键洞察**：LL128 的创新都围绕一个目标：在保持行级完整性的前提下，提升带宽效率到 93.75%
 
-### 2.3 Primitives 类成员变量对比
+### Primitives 类成员变量对比
 
 **代码位置**：prims_ll128.h:11-56
 
@@ -352,7 +333,7 @@ inline __device__ void postSend() {
 
 **内容结构**：
 
-### 3.1 128B 行的内存布局
+### 128B 行的内存布局
 
 **代码位置**：device.h:105-107
 
@@ -400,7 +381,7 @@ uint64_t 索引:  [0]    [1]    [2]    [3]   ...   [14]   [15]
 
 **关键洞察**：128B 行是 LL128 带宽效率提升的基础，93.75% 的效率来自这个精心设计的布局
 
-### 3.2 环形缓冲区中的组织
+### 环形缓冲区中的组织
 
 **回顾环形缓冲区基础**（引用 Simple 03）：
 - 环形缓冲区总大小：`buffSizes[NCCL_PROTO_LL128]`
@@ -449,7 +430,7 @@ inline __device__ uint64_t* sendPtr(int i) { return sendBuff[i]+sendOffset(i); }
 
 **关键点**：LL128 的环形缓冲区组织与 Simple/LL 相同（都用 NCCL_STEPS=8），只是每个 slot 存储的内容不同
 
-### 3.3 DataEltPerSlice 的计算
+### DataEltPerSlice 的计算
 
 **代码位置**：prims_ll128.h:288-289
 
@@ -501,7 +482,7 @@ DataEltPerSlice = (一个warp处理的uint64_t数 - 标志数) * (uint64_t能容
 
 **关键洞察**：DataEltPerSlice 的计算精确地考虑了标志开销，这是 LL128 高效处理数据的关键
 
-### 3.4 ncclProtoGrainSize：LL128 的传输粒度单位
+### ncclProtoGrainSize：LL128 的传输粒度单位
 
 **代码位置**：device.h:311
 
@@ -559,7 +540,7 @@ int eltPerGrain = ncclProtoGrainSize(proto)/eltSize;
 
 **内容结构**：
 
-### 4.1 问题的引入
+### 问题的引入
 
 **从 LL 的双标志说起**（简要回顾，引用 LL 02）：
 - LL 使用 16 字节单元：`[data1:4B][flag1:4B][data2:4B][flag2:4B]`
@@ -579,7 +560,7 @@ int eltPerGrain = ncclProtoGrainSize(proto)/eltSize;
 
 **关键洞察**：单标志设计是带宽效率提升的关键，而 Flag Thread 机制让单标志设计成为可能
 
-### 4.2 Flag Thread 的定义
+### Flag Thread 的定义
 
 **代码位置**：prims_ll128.h:9, 368
 
@@ -626,7 +607,7 @@ flagThread((tid%8)==7)
 
 **关键点**：Flag Thread 不是一个特殊的线程类型，只是普通线程的一个角色标识（布尔值）
 
-### 4.3 写入逻辑：Flag Thread 如何写标志
+### 写入逻辑：Flag Thread 如何写标志
 
 **代码位置**：prims_ll128.h:273-283（在 recvReduceSendCopy 的发送部分）
 
@@ -683,7 +664,7 @@ ptr[15] = flag    // 标志（替换了 v[15]）
 
 **关键洞察**：Flag Thread 通过在写入时"偷梁换柱"（用 flag 替换第二个数据），实现了单标志设计
 
-### 4.4 读取验证：Flag Thread 如何检查标志
+### 读取验证：Flag Thread 如何检查标志
 
 **代码位置**：prims_ll128.h:182-201（在 recvReduceSendCopy 的接收部分）
 
@@ -765,7 +746,7 @@ for (int u=0; u<ELEMS_PER_THREAD; u+=2)
 
 **关键洞察**：Flag Thread 通过 warp 级同步和轮询验证，实现了高效的单标志验证机制
 
-### 4.5 单标志设计的原理
+### 单标志设计的原理
 
 现在我们可以回答：为什么 LL128 可以用单标志，而 LL 必须用双标志？
 
@@ -844,7 +825,7 @@ for (int u=0; u<ELEMS_PER_THREAD; u+=2)
 
 **内容结构**：
 
-### 5.1 场景设置
+### 场景设置
 
 **硬件配置**：
 - 4 个 GPU：GPU 0, 1, 2, 3
@@ -878,7 +859,7 @@ for (int u=0; u<ELEMS_PER_THREAD; u+=2)
 - 与本地数据规约
 - 发送到 GPU 1
 
-### 5.2 从算法到协议：调用链
+### 从算法到协议：调用链
 
 **算法层调用 Primitives 接口**（回顾 Simple 02）：
 ```c
@@ -929,7 +910,7 @@ if (RECV) { step++; postRecv(); }
 - 循环内处理数据，粒度是 DataEltPerSlice
 - 最后统一更新 step 和通知对端
 
-### 5.3 阶段 0：初始状态
+### 阶段 0：初始状态
 
 **GPU 0 的连接状态**（回顾文档 02）：
 - **Recv Connection**（从 GPU 3 接收）：
@@ -953,7 +934,7 @@ if (RECV) { step++; postRecv(); }
 - 处理 16K 个 float 需要：16K / 480 ≈ 34 次循环迭代
 - 但我们只追踪**第一次迭代**
 
-### 5.4 阶段 1：waitSend - 检查缓冲区是否有空间
+### 阶段 1：waitSend - 检查缓冲区是否有空间
 
 **代码位置**：prims_ll128.h:58-70
 
@@ -997,7 +978,7 @@ inline __device__ void waitSend(int nbytes) {
 
 **回顾**：waitSend 的逻辑与 LL 完全一致（文档 02），防止"绕圈追尾"
 
-### 5.5 阶段 2：loadRegsBegin - 加载用户数据（第一阶段）
+### 阶段 2：loadRegsBegin - 加载用户数据（第一阶段）
 
 **代码位置**：prims_ll128.h:87-133
 
@@ -1048,7 +1029,7 @@ for(int g=0; g < WordPerThread/2; g++) {
 
 **关键点**：loadRegsBegin 只是快速加载，不做 shuffle，为了尽快发起接收操作
 
-### 5.6 阶段 3：recvReduceSendCopy - 核心函数（第一部分：等待接收）
+### 阶段 3：recvReduceSendCopy - 核心函数（第一部分：等待接收）
 
 **代码位置**：prims_ll128.h:176-286
 
@@ -1274,7 +1255,7 @@ if (SEND) {
 
 **回顾**：这是 Flag Thread 写入机制（文档 04），通过"偷梁换柱"实现单标志设计
 
-### 5.7 阶段 4：postSend/postRecv - 通知对端
+### 阶段 4：postSend/postRecv - 通知对端
 
 **代码位置**：prims_ll128.h:72-84
 
@@ -1324,7 +1305,7 @@ inline __device__ void postRecv() {
 
 **回顾**：postSend/postRecv 与 LL 完全一致（文档 02），实现 Step 级流控
 
-### 5.8 完整调用链总结
+### 完整调用链总结
 
 **从上到下**：
 1. **算法层**：`prims.recvReduceSend(0, 16K)`
@@ -1350,40 +1331,6 @@ inline __device__ void postRecv() {
 - **Flag Thread 写入**：在发送时"偷梁换柱"，把标志写到行末
 - **Step 级流控**：waitSend 防止绕圈追尾，postSend/postRecv 通知对端
 - **fence 保证顺序**：postSend 时执行 fence，确保数据可见后再更新 tail
-
-**关键洞察**：LL128 的所有机制（Flag Thread、两阶段加载、两层同步）精密配合，实现了 93.75% 的带宽效率和中等延迟
-
-### 5.9 性能分析：为什么 LL128 是平衡点？
-
-**与 LL 对比**：
-- LL：每个 16B 行需要验证双标志（2 个 4B 标志）
-  - 带宽效率：8B / 16B = 50%
-  - 延迟：每个 line 都验证，细粒度同步
-- LL128：每个 128B 行需要验证单标志（1 个 8B 标志）
-  - 带宽效率：120B / 128B = 93.75%
-  - 延迟：每个 128B 行验证，中等粒度同步
-
-**与 Simple 对比**：
-- Simple：KB 级传输单元，几乎没有标志开销
-  - 带宽效率：~99%
-  - 延迟：粗粒度同步（每个 step），启动延迟高
-- LL128：128B 传输单元，单标志开销
-  - 带宽效率：93.75%（接近 Simple）
-  - 延迟：中等粒度同步，启动延迟低（类似 LL）
-
-**LL128 的优势**：
-- 带宽效率接近 Simple（93.75% vs ~99%）
-- 启动延迟低于 Simple（类似 LL）
-- 行级完整性验证（LL 的特性）
-
-**LL128 的代价**：
-- 需要 Flag Thread 机制（代码复杂度）
-- 需要 warp 级同步（轻微开销）
-- 需要两阶段加载（优化延迟）
-
-**在实践中**：
-- 中等消息（几十到几百 KB）：LL128 是最优选择
-- LL128 为深度学习训练中最常见的场景提供了最佳性能
 
 **关键洞察**：LL128 通过精心设计的机制（Flag Thread、单标志、两阶段加载），实现了延迟和带宽的最佳平衡点
 

@@ -85,7 +85,6 @@
 
 ## 文档 02: 数据结构详解
 
-**状态**：待写（新增章节）
 
 **目标**：理解 LL 的关键数据结构及其设计原因
 
@@ -162,6 +161,7 @@ union ncclLLFifoLine* sendBuff[MaxSend];
 - `recvFlag(i)` / `sendFlag(i)`：计算期望的标志值（`NCCL_LL_FLAG(step+1)`）
 
 **与 Simple 的对比**：
+
 | 字段 | Simple Primitives | LL Primitives |
 |------|-------------------|---------------|
 | 缓冲区指针类型 | `T* connEltsFifo` | `ncclLLFifoLine* recvBuff/sendBuff` |
@@ -333,72 +333,13 @@ __device__ uint64_t readLL(int offset, int i) {
 - 只有**全部匹配**才允许 RDMA 发送
 - 如果有任何一个不匹配，`ready = 0`，等待下次轮询
 
-### 完整的时序图
 
-```
-<ImageDescription>
-节点间通信：GPU 0 发送给 GPU 1（通过 RDMA）
-
-时间轴从上到下：
-
-GPU 0 (Sender)              Proxy 0              RDMA              GPU 1 (Receiver)
-     |                         |                   |                     |
-storeLL(line 0)                |                   |                     |
-写入 16 字节到本地 GPU 内存    |                   |                     |
-     |                         |                   |                     |
-     |                    Proxy 轮询                |                     |
-     |                    检查 flag1==flag?         |                     |
-     |                    检查 flag2==flag?         |                     |
-     |                    验证通过 ✅               |                     |
-     |                         |                   |                     |
-     |                    触发 RDMA Isend ---------->|                     |
-     |                         |              传输前 8 字节               |
-     |                         |              (data1+flag1) -------------> |
-     |                         |                   |                     |
-     |                         |                   |                readLL()
-     |                         |                   |                自旋等待
-     |                         |                   |                flag2 不匹配
-     |                         |                   |                继续等待
-     |                         |              传输后 8 字节               |
-     |                         |              (data2+flag2) -------------> |
-     |                         |                   |                     |
-     |                         |                   |                readLL()
-     |                         |                   |                flag1==flag ✅
-     |                         |                   |                flag2==flag ✅
-     |                         |                   |                读取数据
-     |                         |                   |                     |
-</ImageDescription>
-```
-
-### 总结
-
-**双标志位提供的保护**：
-- **节点内**：统一接口，防御性设计
-- **节点间**：应对 RDMA 的 8 字节原子性限制
-
-**三道防线**：
-1. **标志后置**：保证"看到标志 = 数据已到达"
-2. **双标志位**：提供双重验证
-3. **Proxy 验证**：确保 GPU-CPU 内存一致性
-
-**关键洞察**：
-- 双标志位是 LL 正确性的**核心机制**
-- 标志后置是**基石**，双标志位是**保障**
-- Proxy 验证是 GPU-CPU 内存一致性的**桥梁**
-- **天然容错**：RDMA 部分传输不会导致错误读取
-
-**代码验证位置**：
-- `src/device/prims_ll.h:126-128` (storeLL 实现)
-- `src/device/prims_ll.h:89-100` (readLL 实现)
-- `src/transport/net.cc:1296-1303` (Proxy 验证逻辑)
 
 **预计篇幅**：700-900 行
 
 ---
 
 ## 文档 04: 流控机制 - 两层防护
-
-**状态**：待写
 
 **目标**：理解 LL Protocol 的同步机制，以及它与 Simple 的差异
 
@@ -410,7 +351,7 @@ storeLL(line 0)                |                   |                     |
 **内容结构**：
 
 ### Simple Protocol 同步机制回顾
-- 简要回顾（引用 Simple 04）
+- 简要回顾（引用 [流控机制](../protocol_simple/04_流控机制.md)）
 - 关键点：step 级同步，粗粒度
 - `waitPeer` 检查 `remote_head + 8 < local_step`
 - `postPeer` 更新 remote_tail/remote_head
@@ -609,6 +550,7 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 - **Step 级**（waitSend/postRecv）：流控保证，粗粒度，低开销
 
 **与 Simple 的差异**：
+
 | 维度 | Simple | LL |
 |------|--------|-----|
 | 细粒度同步 | 无 | Line 级标志验证 |
@@ -633,8 +575,6 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 ---
 
 ## 文档 05: 把所有拼图拼起来
-
-**状态**：待写
 
 **目标**：通过一个具体的 Ring AllReduce 实例，展示前四章所有概念如何协同工作
 
@@ -783,59 +723,6 @@ while (nelem > 0) {
 - Simple 传输大块（512KB），对齐问题在大块传输中不明显
 - LL 传输细粒度（16 字节），对齐问题更突出
 
-### 完整流程时序图
-
-```
-<ImageDescription>
-GPU 0 在 Reduce-Scatter 步骤 1 的完整流程：
-
-时间轴从上到下：
-
-GPU 0                          GPU 3 (Peer)                GPU 1 (Next)
-     |                              |                           |
-waitSend(512 * 16 = 8192 字节)     |                           |
-检查 head + 8 < step + 1? 是        |                           |
-sendConnHead += 1                  |                           |
-barrier()                          |                           |
-     |                              |                           |
---- 主循环开始（512 次迭代）---      |                           |
-     |                              |                           |
-线程 0, 迭代 1 (line 0):            |                           |
-  loadBegin(userBuf[0:2])          |                           |
-  readLL(offset=0) ----------------> storeLL 已完成              |
-    自旋等待 flag1==flag?            |                           |
-    自旋等待 flag2==flag?            |                           |
-    读取 peerData                    |                           |
-  loadFinish()                     |                           |
-  data = userBuf[0:2] + peerData   |                           |
-  storeLL(offset=0, data, flag) --------------------------------> readLL 等待
-  写入 line 0                       |                           |
-     |                              |                           |
-线程 1, 迭代 1 (line 1):            |                           |
-  [类似过程]                        |                           |
-     |                              |                           |
-...（256 个线程并行）                |                           |
-     |                              |                           |
-线程 0, 迭代 2 (line 256):          |                           |
-  [类似过程]                        |                           |
-     |                              |                           |
-...（总共 512 次迭代）               |                           |
-     |                              |                           |
---- 主循环结束 ---                  |                           |
-     |                              |                           |
-incRecv(0)                         |                           |
-recvStep[0] += 1                   |                           |
-postRecv()                         |                           |
-  barrier()                        |                           |
-  *recvConnHeadPtr = recvConnHead+1 -> GPU 3 看到 head 更新      |
-     |                              |                           |
-incSend(0)                         |                           |
-sendStep[0] += 1                   |                           |
-（如果需要清理，遍历所有 line）      |                           |
-     |                              |                           |
-</ImageDescription>
-```
-
 ### 延迟和带宽分析
 
 **延迟分析**（4KB AllReduce）：
@@ -941,7 +828,15 @@ sendStep[0] += 1                   |                           |
 4. ❌ 不要陷入代码细节（这是概念系列）
 5. ❌ 不要假设读者知道 LL 特有的概念
 
----
+## 进度跟踪
+
+- [ ] 文档 01: LL Protocol 概览（800-1000 行）
+- [ ] 文档 02: 数据结构详解（800-1000 行）**【新增】**
+- [ ] 文档 03: 双标志位机制详解（700-900 行）
+- [ ] 文档 04: 流控机制 - 两层防护（800-1000 行，包含标志回绕）
+- [ ] 文档 05: 把所有拼图拼起来（700-900 行）
+
+**总计**：约 4000-4800 行，五章完整覆盖 LL Protocol 核心机制
 
 ## 关键差异总结（LL vs Simple）
 
@@ -968,20 +863,6 @@ sendStep[0] += 1                   |                           |
 ### 线程分工
 - **Simple**：Wait/Worker/Post 线程分工明确
 - **LL**：所有线程统一工作（没有角色分工）
-
----
-
-## 进度跟踪
-
-- [ ] 文档 01: LL Protocol 概览（800-1000 行）
-- [ ] 文档 02: 数据结构详解（800-1000 行）**【新增】**
-- [ ] 文档 03: 双标志位机制详解（700-900 行）
-- [ ] 文档 04: 流控机制 - 两层防护（800-1000 行，包含标志回绕）
-- [ ] 文档 05: 把所有拼图拼起来（700-900 行）
-
-**总计**：约 4000-4800 行，五章完整覆盖 LL Protocol 核心机制
-
----
 
 ## 与 Simple Protocol 系列的关系
 
@@ -1011,38 +892,3 @@ sendStep[0] += 1                   |                           |
 - **文档 08**：LL Protocol 代码深潜 - LLGenericOp 逐行分析（模板展开）
 
 但这些都是在概念系列完成、读者充分理解后才适合的扩展内容。
-
----
-
-## 关键修正点总结（相对于原大纲）
-
-1. **新增"数据结构详解"章节**（最重要的改动）
-   - 把 ncclLLFifoLine 的详细讲解从 01 移到 02
-   - 补充 LL Primitives 的成员变量讲解
-   - 补充环形缓冲区布局和 stepLines 计算
-   - 补充 EltPerLine 概念
-
-2. **01 概览更宏观**
-   - 去掉所有数据结构细节（不讲为什么 16 字节、不讲为什么标志后置）
-   - 只讲核心思想和高层机制
-   - 聚焦"为什么需要"和"是什么"
-
-3. **把标志回绕合并到流控机制**
-   - 作为 04 的子章节（4.6）
-   - 避免过度细化
-   - 逻辑更连贯（标志回绕是流控的一部分）
-
-4. **05 改名为"把所有拼图拼起来"**
-   - 与 Simple 保持一致
-   - 更友好、更强调实例驱动
-   - 避免技术术语（LLGenericOp）
-
-5. **每章都明确"与 Simple 的对比"位置**
-   - 对比要在理解之后
-   - 不要用对比代替解释
-   - 强调 LL 的独特性
-
-6. **所有概念都依托代码验证**
-   - 每个关键点都附上代码位置
-   - 用实际代码验证理论描述
-   - 确保正确性

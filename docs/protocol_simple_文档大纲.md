@@ -1,4 +1,4 @@
-# Simple Protocol 文档系列计划（修订版）
+# Simple Protocol 文档系列计划
 
 ## 整体结构
 
