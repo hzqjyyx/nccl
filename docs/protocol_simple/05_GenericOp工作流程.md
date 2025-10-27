@@ -70,15 +70,15 @@ genericOp 的任务是：**把一次数据传输（可能很大）拆分成多�
 举个例子：
 
 ```
-任务：发送 100MB 数据
-环形缓冲区：32MB（8 个 slot × 4MB）
-sliceSize：4MB（每个 slice 的大小）
+任务：发送 10MiB 数据
+环形缓冲区：4MiB（8 个 slot × 512KiB，默认配置）
+sliceSize：512KiB（每个 slice 的大小）
 
 genericOp 会做：
-- 计算需要多少 slice：100MB / 4MB = 25 个 slice
-- 循环 25 次，每次：
+- 计算需要多少 slice：10MiB / 512KiB = 20 个 slice
+- 循环 20 次，每次：
   1. waitPeer：等待 slot 可用
-  2. reduceCopy：拷贝 4MB 数据
+  2. reduceCopy：拷贝 512KiB 数据
   3. postPeer：通知对端
 ```
 
@@ -139,7 +139,7 @@ genericOp<0, 0, 1, 1, Input, Output>(inpIx, outIx, count, false);
 **核心问题**：如何在有限的环形缓冲区上传输任意大小的数据？
 
 - 用户要传输的数据可能是 1GB（很大）
-- 环形缓冲区只有 32MB（8 个 slot × 4MB）
+- 环形缓冲区只有 4MiB（8 个 slot × 512KiB，默认配置）
 - 每次传输只能用环形缓冲区的一部分
 
 **解决方案**：分层抽象
@@ -233,9 +233,9 @@ Slice 是**协议层**（genericOp）处理数据的基本单位。一个 slice 
 **例子**：
 
 ```
-一个 chunk 的大小：16MB
-环形缓冲区的 slot 大小：4MB
-需要分成 4 个 slice，每个 4MB
+一个 chunk 的大小：2MiB
+环形缓冲区的 slot 大小：512KiB
+需要分成 4 个 slice，每个 512KiB
 ```
 
 **SlicePerChunk：一次 genericOp 处理多少个 slice**
@@ -308,60 +308,60 @@ sliceSize = max(divUp(nelem, 16*SlicePerChunk)*16, sliceSize/32);
 
 ```
 nelem = 1024 个元素
-stepSize = 1M 个元素
+stepSize = 128K 个元素（512KiB / 4字节）
 SlicePerChunk = 1
 StepPerSlice = 1
 
-基础值：sliceSize = 1M * 1 = 1M
+基础值：sliceSize = 128K * 1 = 128K
 
 调整：
   理想值 = divUp(1024, 16*1) * 16 = divUp(1024, 16) * 16 = 64 * 16 = 1024
-  最小值 = 1M / 32 = 32K
-  sliceSize = max(1024, 32K) = 32K
+  最小值 = 128K / 32 = 4K
+  sliceSize = max(1024, 4K) = 4K
 
-最终：sliceSize = 32K（远小于 1M，节省空间）
+最终：sliceSize = 4K（远小于 128K，节省空间）
 ```
 
 **例子 2：中等消息**
 
 ```
-nelem = 512K 个元素
-stepSize = 1M
+nelem = 64K 个元素
+stepSize = 128K
 SlicePerChunk = 1
 StepPerSlice = 1
 
-基础值：sliceSize = 1M
+基础值：sliceSize = 128K
 
 调整：
-  理想值 = divUp(512K, 16) * 16 = 32K * 16 = 512K
-  最小值 = 1M / 32 = 32K
-  sliceSize = max(512K, 32K) = 512K
+  理想值 = divUp(64K, 16) * 16 = 4K * 16 = 64K
+  最小值 = 128K / 32 = 4K
+  sliceSize = max(64K, 4K) = 64K
 
-最终：sliceSize = 512K（整个 chunk 作为一个 slice）
+最终：sliceSize = 64K（整个 chunk 作为一个 slice）
 ```
 
 **例子 3：大消息**
 
 ```
-nelem = 10M 个元素（算法层传入的一个 chunk）
-stepSize = 1M
+nelem = 1M 个元素（算法层传入的一个 chunk）
+stepSize = 128K
 SlicePerChunk = 1
 StepPerSlice = 1
 
-基础值：sliceSize = 1M
+基础值：sliceSize = 128K
 
 调整：
-  理想值 = divUp(10M, 16) * 16 = 625K * 16 = 10M
-  最小值 = 1M / 32 = 32K
-  sliceSize = max(10M, 32K) = 10M
+  理想值 = divUp(1M, 16) * 16 = 62.5K * 16 = 1M
+  最小值 = 128K / 32 = 4K
+  sliceSize = max(1M, 4K) = 1M
 
-等等，10M 远大于 stepSize 1M，这意味着什么？
+等等，1M 远大于 stepSize 128K，这意味着什么？
 
 在循环中，sliceSize 会进一步调整：
   sliceSize = min(sliceSize, nelem - offset)
 
-第 1 次循环：sliceSize = min(10M, 10M - 0) = 10M（但实际传输时会被截断到 stepSize）
-第 2 次循环：sliceSize = min(10M, 10M - 1M) = 9M
+第 1 次循环：sliceSize = min(1M, 1M - 0) = 1M（但实际传输时会被截断到 stepSize）
+第 2 次循环：sliceSize = min(1M, 1M - 128K) = 872K
 ...
 
 实际上，如果 sliceSize > stepSize，说明这个 chunk 需要多次循环处理。
@@ -467,14 +467,14 @@ Reduce-Scatter 阶段，GPU 0 会执行 4 次 genericOp：
 ```
 每次 genericOp 调用：
   nelem = 512K
-  stepSize = 1M
+  stepSize = 128K（512KiB / 4字节）
   SlicePerChunk = 1
 
   sliceSize 计算：
-    基础值 = 1M * 1 = 1M
+    基础值 = 128K * 1 = 128K
     理想值 = divUp(512K, 16*1) * 16 = 32K * 16 = 512K
-    最小值 = 1M / 32 = 32K
-    sliceSize = max(512K, 32K) = 512K
+    最小值 = 128K / 32 = 4K
+    sliceSize = max(512K, 4K) = 512K
 
   slice 数量 = divUp(nelem, sliceSize) = divUp(512K, 512K) = 1
 
@@ -486,21 +486,21 @@ Reduce-Scatter 阶段，GPU 0 会执行 4 次 genericOp：
 ```
 每个 slice：
   sliceSize = 512K
-  stepSize = 1M
-  StepPerSlice = 1（因为 sliceSize < stepSize）
+  stepSize = 128K
+  StepPerSlice = divUp(512K, 128K) = 4（因为 sliceSize > stepSize）
 
   每次 wait-copy-post 循环：
-    step 增加 1
+    step 增加 4
     slot = step % 8
 
   第 1 次 genericOp：
-    Slice 0: step = 0 → slot 0
+    Slice 0: step = 0 → 4（占用 slot 0,1,2,3）
   第 2 次 genericOp：
-    Slice 0: step = 1 → slot 1
+    Slice 0: step = 4 → 8（占用 slot 4,5,6,7）
   第 3 次 genericOp：
-    Slice 0: step = 2 → slot 2
+    Slice 0: step = 8 → 12（占用 slot 0,1,2,3，循环回来）
   第 4 次 genericOp：
-    Slice 0: step = 3 → slot 3
+    Slice 0: step = 12 → 16（占用 slot 4,5,6,7）
 ```
 
 **完整的数据流**：
@@ -1123,10 +1123,10 @@ genericOp 的完整流程图：
 
 **环境**：
 - Ring 拓扑：GPU 0 → GPU 1 → GPU 2 → GPU 3 → GPU 0
-- 环形缓冲区：32MB（8 个 slot × 4MB = 8 个 slot × 1M 个 float）
+- 环形缓冲区：4MiB（8 个 slot × 512KiB = 8 个 slot × 128K 个 float）
 - SlicePerChunk = 1
-- StepPerSlice = 1
-- stepSize = 1M 个元素
+- StepPerSlice = 4（每个slice占用4个slot）
+- stepSize = 128K 个元素
 
 **Ring AllReduce 的两个阶段**：
 1. **Reduce-Scatter**：每个 GPU 负责 reduce 一块数据
@@ -1202,18 +1202,18 @@ genericOp<0, 0, 1, 1, Input, Output>(chunkOffset, chunkOffset, chunkCount, false
 
 ```c
 nelem = 512K;
-stepSize = 1M;
+stepSize = 128K;
 SlicePerChunk = 1;
-StepPerSlice = 1;
 
 // 计算 sliceSize
-sliceSize = stepSize * StepPerSlice = 1M * 1 = 1M;
+sliceSize = stepSize * StepPerSlice = 128K * 1 = 128K;
 sliceSize = max(divUp(nelem, 16*SlicePerChunk)*16, sliceSize/32);
-sliceSize = max(divUp(512K, 16)*16, 1M/32);
-sliceSize = max(32K*16, 32K);
-sliceSize = max(512K, 32K) = 512K;
+sliceSize = max(divUp(512K, 16)*16, 128K/32);
+sliceSize = max(32K*16, 4K);
+sliceSize = max(512K, 4K) = 512K;
 
 // 所以 sliceSize = 512K（整个 chunk 作为一个 slice）
+// StepPerSlice = divUp(512K, 128K) = 4
 
 slice = 0;
 offset = 0;
