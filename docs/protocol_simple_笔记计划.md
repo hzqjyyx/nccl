@@ -92,30 +92,6 @@
   - `head`：指向**本地**内存（我控制 head，告诉接收方我写到哪了）
 
 - **内存布局图示**：
-  ```
-  <ImageDescription>
-  两个 GPU 的内存布局对比图：
-  GPU 0 内存：
-  - ring buffer (1MB)
-  - head counter = 0
-  - tail counter = 0
-
-  GPU 1 内存：
-  - ring buffer (1MB)
-  - head counter = 0
-  - tail counter = 0
-
-  GPU 0 的 Send Connection 指向：
-  - buffs -> GPU 1 的 ring buffer
-  - tail -> GPU 1 的 tail counter
-  - head -> GPU 0 的 head counter（本地）
-
-  GPU 1 的 Recv Connection 指向：
-  - buffs -> GPU 1 的 ring buffer（本地）
-  - tail -> GPU 1 的 tail counter（本地）
-  - head -> GPU 0 的 head counter
-  </ImageDescription>
-  ```
 
 - **其他重要字段**：
   - `stepSize`：每个 slot 的大小（字节）
@@ -170,8 +146,6 @@
 - step 和 slot 的关系是什么？
 - 为什么选择 8 个 slot？
 
-**内容结构**：
-
 #### 3.1 为什么需要环形缓冲区？
 - 问题：如果只有一个缓冲区会怎样？
 - 流水线的需求
@@ -184,67 +158,26 @@
   - 为什么是 8？（平衡内存占用和流水线深度）
   - 这是硬编码常量，不可配置
 - **每个 slot 的大小**：`stepSize = buffSizes / NCCL_STEPS`
-- **slot 的地址计算**：
-  ```c
-  slotAddr = buffs + (step % NCCL_STEPS) * stepSize
-  ```
-- **内存布局图**：
-  ```
-  <ImageDescription>
-  环形缓冲区的线性内存布局：
-  |<------------ buffSizes (e.g., 1MB) ----------->|
-  |slot0|slot1|slot2|slot3|slot4|slot5|slot6|slot7|
-  |128KB|128KB|128KB|128KB|128KB|128KB|128KB|128KB|
-
-  每个 slot 可以存储 stepSize 字节的数据
-  通过 step % 8 计算当前使用的 slot
-  </ImageDescription>
-  ```
+- **slot 的地址计算**
+- **内存布局图**
 
 #### 3.3 step 计数器的语义
 - **step 不是 slot 索引**！
 - step 是一个单调递增的逻辑计数器
 - slot 索引通过 `step % NCCL_STEPS` 计算
 - 为什么需要单调递增？（用于判断是否"绕圈"）
-- 例子：
-  ```
-  step = 0 -> slot 0
-  step = 1 -> slot 1
-  ...
-  step = 7 -> slot 7
-  step = 8 -> slot 0 (循环回来)
-  step = 9 -> slot 1
-  ...
-  step = 16 -> slot 0 (第二圈)
-  ```
+- 例子
 
-#### 3.4 环形缓冲区的使用过程
-- **初始状态**：head = 0, tail = 0
-- **发送方视角**：
-  1. 检查 `tail + NCCL_STEPS > step`（有空闲 slot）
-  2. 写数据到 slot `(step % 8)`
-  3. 更新 tail = step + StepPerSlice
-- **接收方视角**：
-  1. 检查 `head < step`（有新数据）
-  2. 读数据从 slot `(step % 8)`
-  3. 更新 head = step + StepPerSlice
-
-#### 3.5 StepPerSlice 的含义
+#### 3.4 StepPerSlice 的含义
 - **什么是 StepPerSlice**：每个 slice 跨越几个 step
 - **通常值为 1**：一个 slice 占用一个 step
 - **什么时候大于 1**：超大消息可能需要多个 step
 - **影响**：控制流水线的粒度
 
-#### 3.6 流水线效果
-- 时序图：展示发送方和接收方如何流水线工作
-- 8 个 slot 如何形成"缓冲垫"
-- 为什么 8 是个好的选择（经验值）
-
 **关键洞察**：
 - step 是逻辑计数器，slot 是物理位置
 - 环形设计让内存可以重复使用
 - 8 个 slot 的深度让收发双方可以"错开"工作
-- NCCL_STEPS = 8 是硬编码的，基于大量实践得出的最优值
 
 **预计篇幅**：600-900 行
 
@@ -272,25 +205,12 @@
 #### 4.2 理解 Primitives 中的指针设置
 
 **关键代码**（[prims_simple.h](https://github.com/NVIDIA/nccl/blob/master/src/device/prims_simple.h)）：
-```c
-// 接收方设置
-if (flags & RoleWaitRecv) {
-  connStepPtr = conn->tail;  // 指向远端的 tail
-  connStepCache = loadStepValue(connStepPtr);
-}
-if (flags & RolePostRecv) {
-  connStepPtr = conn->head;  // 指向本地的 head，用于更新
-}
 
-// 发送方设置
-if (flags & RoleWaitSend) {
-  connStepPtr = conn->head;  // 指向远端的 head
-  connStepCache = loadStepValue(connStepPtr);
-}
-if (flags & RolePostSend) {
-  connStepPtr = conn->tail;  // 指向本地的 tail，用于更新
-}
-```
+**关键洞察：**
+- **RoleWaitRecv** 线程：`connStepPtr` 指向**远端的 tail**，`connStepCache` 缓存远端 tail 的值
+- **RolePostRecv** 线程：`connStepPtr` 指向**本地的 head**，用于更新
+- **RoleWaitSend** 线程：`connStepPtr` 指向**远端的 head**，`connStepCache` 缓存远端 head 的值
+- **RolePostSend** 线程：`connStepPtr` 指向**本地的 tail**，用于更新
 
 #### 4.3 waitPeer 的逻辑
 
