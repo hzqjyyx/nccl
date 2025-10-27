@@ -121,6 +121,7 @@ GPU 0 的任务：
 **关键点**：
 - GPU 3 通过 P2P 把数据写到 GPU 0 的 ring buffer
 - GPU 0 从本地 ring buffer 读取 GPU 3 的数据
+- GPU 0 从本地（另一个位置）读取 local 数据（属于 GPU0 的 Chunk 3）
 - GPU 0 通过 P2P 把结果写到 GPU 1 的 ring buffer
 - **零拷贝**：数据直接在 GPU 间传输，没有中间缓冲
 
@@ -173,8 +174,6 @@ __device__ void recvReduceSend(intptr_t inpIx, int eltN, bool postOp=false) {
 3. **postPeer**：通知对端完成
 
 现在让我们深入每个阶段，看看它们是如何工作的。
-
----
 
 ## 第一阶段：waitPeer - 确认可以开始
 
