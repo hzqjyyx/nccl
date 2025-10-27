@@ -1,0 +1,315 @@
+COMPLETE CALL PATH: ncclAllReduce -> Device-Side Simple Protocol Execution
+============================================================================
+
+This document traces the complete execution path from the public ncclAllReduce API
+down to the device-side kernel execution using the Simple Protocol.
+
+1. PUBLIC API ENTRY POINT
+========================
+
+File: /workspace/nccl/src/collectives.cc
+Lines: 107-118
+
+ncclAllReduce() -> ncclEnqueueCheck()
+  - Creates ncclInfo structure with collective parameters
+  - Calls ncclEnqueueCheck(&info) to enqueue the operation
+
+2. ENQUEUE PHASE
+===============
+
+File: /workspace/nccl/src/enqueue.cc
+Lines: 2620-2650
+
+ncclEnqueueCheck(struct ncclInfo* info):
+  - Validates communicator and arguments
+  - Calls ncclGroupStartInternal()
+  - Calls taskAppend(info->comm, info) to append task to planner
+  - Calls ncclGroupEndInternal() to trigger execution
+
+3. TASK APPEND PHASE
+====================
+
+File: /workspace/nccl/src/enqueue.cc
+Lines: 2548-2618
+
+taskAppend(struct ncclComm* comm, struct ncclInfo* info):
+  - For non-send/recv collectives (like AllReduce):
+    - Converts ncclInfo to ncclTaskColl structure
+    - Calls collTaskAppend(comm, info, opDev)
+    
+File: /workspace/nccl/src/enqueue.cc
+Lines: 2453-2495
+
+collTaskAppend(struct ncclComm* comm, struct ncclInfo* info, struct ncclDevRedOpFull opDev):
+  - Allocates ncclTaskColl from memory pool
+  - Copies operation info: sendbuff, recvbuff, count, datatype, operation, algorithm, protocol
+  - Stores chunkSteps and sliceSteps from collective info
+  - Inserts task into planner->collSorter
+
+4. ALGORITHM & PROTOCOL SELECTION
+==================================
+
+File: /workspace/nccl/src/enqueue.cc
+Lines: 349-438
+
+ncclPrepareTasksAndCollPreconnect() -> ncclTasksRegAndEnqueue():
+  - Dequeues tasks from collSorter
+  - For aggregated operations of same function/op/type:
+    - Calls getAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, ...) at line 399
+
+File: /workspace/nccl/src/enqueue.cc
+Lines: 1918-1975
+
+getAlgoInfo(struct ncclComm* comm, struct ncclTaskColl* info, ...):
+  - Calls topoGetAlgoInfo() to select algorithm and protocol
+  - Tuner plugin may override selection
+  
+File: /workspace/nccl/src/enqueue.cc
+Lines: 1822-1912
+
+topoGetAlgoInfo(struct ncclComm* comm, struct ncclTaskColl* info, ...):
+  - Iterates through collCostTable[algorithm][protocol] 
+  - Selects algorithm and protocol with minimum cost time
+  - For SIMPLE protocol: Sets extra warps for synchronization (line 1901-1905)
+  - Returns selected algorithm and protocol
+
+KEY SELECTION: For AllReduce RING:
+  - Algorithm: NCCL_ALGO_RING (value 1)
+  - Protocol: NCCL_PROTO_SIMPLE (value 2)  <- SELECTED HERE
+
+Line 400:
+  agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, 
+                                 agg.algorithm, agg.protocol);
+
+5. KERNEL FUNCTION ID COMPUTATION
+==================================
+
+File: /workspace/nccl/src/include/device.h
+Lines: 562-615
+
+ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto):
+  - Computes row index into kernel table based on:
+    - coll: ncclFuncAllReduce (4)
+    - devRedOp: Reduction operation (Sum, Prod, etc.)
+    - type: Data type (f32, f64, etc.)
+    - algo: NCCL_ALGO_RING (1)
+    - proto: NCCL_PROTO_SIMPLE (2)
+  - Returns ncclDevFuncRowToId[row] = kernel function ID
+  
+For AllReduce RING SIMPLE with Sum and float32:
+  row = 1 + (nAlgos_AG*protos)*4 + ((redOp*types + type)*6 + 1)*3 + 2
+      where nAlgos_AG=4, protos=3, redOp=0, types=12, type depends on dtype
+
+6. KERNEL PLAN CREATION
+=======================
+
+File: /workspace/nccl/src/enqueue.cc
+Lines: 350-438
+
+After algorithm selection, tasks processed through kernel planner:
+
+- Line 578: calcCollChunking() computes chunk sizes
+- Lines 593, 722: addWorkBatchToPlan() creates work batches
+- Line 734: plan->kernelFn = ncclDevKernelForFunc[task->devFuncId]
+
+This selects the specific kernel template instantiation for:
+  - AllReduce
+  - RING algorithm
+  - SIMPLE protocol
+  - Selected reduction operation
+  - Selected data type
+
+7. GROUP LAUNCH PHASE
+=====================
+
+File: /workspace/nccl/src/group.cc
+Lines: 646-765
+
+ncclGroupEndInternal():
+  - Calls groupLaunch(&groupJob->base) at line 743
+
+File: /workspace/nccl/src/group.cc
+Lines: 509-639
+
+groupLaunch(struct ncclAsyncJob *job_):
+  - Calls ncclPrepareTasksAndCollPreconnect() for each communicator clique
+  - Calls ncclTasksRegAndEnqueue() to register buffers
+  - Calls doLaunches() at line 605 to launch kernels
+
+File: /workspace/nccl/src/group.cc
+Lines: 259-329
+
+doLaunches(struct ncclComm* head):
+  - Iterates over cliques of communicators
+  - For each communicator:
+    - Calls ncclLaunchPrepare(comm)
+    - Loops over unlaunched kernel plans:
+      - Pops from comm->planner.unlaunchedPlansHead (line 301)
+      - Calls ncclLaunchKernel(comm, plan) at line 309
+
+8. KERNEL LAUNCH
+================
+
+File: /workspace/nccl/src/enqueue.cc
+Lines: 1565-1664
+
+ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan):
+  - Extracts kernel function from plan->kernelFn
+  - Builds grid and block dimensions
+  - Sets up kernel arguments from plan->kernelArgs
+  - Launches via cuLaunchKernel() or cuLaunchKernelEx()
+  
+KERNEL LAUNCH PARAMETERS:
+  - grid.x = number of channels
+  - block.x = plan->threadPerBlock (computed based on algorithm/protocol)
+  - shared memory = ncclShmemDynamicSize(cudaArch)
+  - Kernel arguments passed via CU_LAUNCH_PARAM_BUFFER_POINTER
+
+9. DEVICE-SIDE KERNEL ENTRY
+============================
+
+The kernel entry point is a template-specialized function generated at compile time.
+
+For AllReduce RING SIMPLE, the instantiation is:
+
+File: /workspace/nccl/src/device/all_reduce.h
+Lines: 233-238
+
+struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    using Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS/ALLREDUCE_SLICESTEPS, 
+                             ALLREDUCE_SLICESTEPS>;
+    runRing<T, RedOp, Proto>(tid, nthreads, work);
+  }
+};
+
+10. PRIMITIVES CLASS INSTANTIATION - THE KEY POINT
+===================================================
+
+File: /workspace/nccl/src/device/all_reduce.h
+Lines: 13-31
+
+runRing<T, RedOp, Proto>() creates Primitives instance at line 29:
+
+Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
+  (tid, nthreads, &ring->prev, &ring->next, 
+   work->sendbuff, work->recvbuff, work->redOpArg, 0, 0, 0, work);
+
+WHERE Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS/ALLREDUCE_SLICESTEPS, 
+                          ALLREDUCE_SLICESTEPS>
+
+This instantiates the template specialization for SimpleProtocol:
+
+File: /workspace/nccl/src/device/prims_simple.h
+Lines: 16-20
+
+template<typename T, typename RedOp, typename Fan, int Direct,
+         int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, 
+         int MultimemSrcs, int MultimemDsts, bool isNetOffload>
+class Primitives<
+    T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, 
+                                        MultimemSrcs, MultimemDsts>, P2p, isNetOffload
+  > { ... }
+
+11. PROTOCOL CLASS DEFINITION
+=============================
+
+File: /workspace/nccl/src/device/primitives.h
+Lines: 24-43
+
+template<int SlicePerChunk_1, int StepPerSlice_1, int Unroll_1 = COLL_UNROLL, 
+         int MultimemSrcs_1 = 0, int MultimemDsts_1 = 0>
+struct ProtoSimple {
+  static constexpr int Id = NCCL_PROTO_SIMPLE;  // = 2
+  static constexpr int SlicePerChunk = SlicePerChunk_1;
+  static constexpr int StepPerSlice = StepPerSlice_1;
+  static constexpr int Unroll = Unroll_1;
+  static constexpr int MultimemSrcs = MultimemSrcs_1;
+  static constexpr int MultimemDsts = MultimemDsts_1;
+  
+  __device__ static int calcBytePerStep() {
+    return ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  }
+  ...
+};
+
+12. COMMUNICATION EXECUTION
+============================
+
+The Primitives class (with ProtoSimple specialization) implements methods:
+  - directSend(offset, offset, nelem)
+  - directRecvReduceDirectSend(offset, offset, nelem)
+  - directRecvCopyDirectSend(offset, offset, nelem)
+  - directRecv(offset, nelem)
+
+Each method uses ProtoSimple's parameters to:
+  - Determine step size: Proto::calcBytePerStep()
+  - Synchronize between peers using barriers
+  - Perform data transfers in the SIMPLE protocol style
+  - Execute reduction operations inline
+
+File: /workspace/nccl/src/device/prims_simple.h
+Lines: 200-400+ (various communication methods)
+
+The SIMPLE protocol:
+  - Uses direct memory access (full payload per step)
+  - Simpler than LL (Low Latency) which uses flag-based signaling
+  - Better for large messages where latency is less critical
+  - Uses thread synchronization barriers
+
+KEY FILES AND LINE REFERENCES
+===============================
+
+1. ncclAllReduce API:
+   /workspace/nccl/src/collectives.cc:109-118
+
+2. Enqueue & Task Append:
+   /workspace/nccl/src/enqueue.cc:2620-2650 (ncclEnqueueCheck)
+   /workspace/nccl/src/enqueue.cc:2548-2618 (taskAppend)
+   /workspace/nccl/src/enqueue.cc:2453-2495 (collTaskAppend)
+
+3. Algorithm & Protocol Selection:
+   /workspace/nccl/src/enqueue.cc:1918-1975 (getAlgoInfo)
+   /workspace/nccl/src/enqueue.cc:1822-1912 (topoGetAlgoInfo)
+
+4. Kernel Function ID Computation:
+   /workspace/nccl/src/include/device.h:562-615 (ncclDevFuncId)
+
+5. Kernel Planning & Launch:
+   /workspace/nccl/src/enqueue.cc:1565-1664 (ncclLaunchKernel)
+
+6. Group Execution:
+   /workspace/nccl/src/group.cc:259-329 (doLaunches)
+   /workspace/nccl/src/group.cc:509-639 (groupLaunch)
+   /workspace/nccl/src/group.cc:646-765 (ncclGroupEndInternal)
+
+7. Device-Side Kernel:
+   /workspace/nccl/src/device/all_reduce.h:233-238 (RunWorkColl RING SIMPLE)
+   /workspace/nccl/src/device/all_reduce.h:13-83 (runRing<T, RedOp, Proto>)
+
+8. Primitives Classes:
+   /workspace/nccl/src/device/primitives.h:24-43 (ProtoSimple struct)
+   /workspace/nccl/src/device/primitives.h:106-107 (Primitives declaration)
+   /workspace/nccl/src/device/prims_simple.h:16-20 (ProtoSimple specialization)
+
+9. Code Generation:
+   /workspace/nccl/src/device/generate.py (kernel specialization generation)
+
+SIMPLE PROTOCOL CHARACTERISTICS
+===============================
+
+The Simple Protocol is selected by topoGetAlgoInfo() based on cost tables.
+It is characterized by:
+
+1. Direct memory access patterns (no flag-based flow control)
+2. Full data payload per step (not split like LL)
+3. Barrier-based synchronization between thread groups
+4. Suitable for large messages (bandwidth-optimized)
+5. Less latency-sensitive than LL protocol
+
+Configuration in ProtoSimple template:
+  - SlicePerChunk, StepPerSlice: Chunking parameters
+  - Unroll: Loop unrolling factor
+  - MultimemSrcs/Dsts: Multimem source/destination count
+  - calcBytePerStep(): Returns total buffer size / NCCL_STEPS
+
