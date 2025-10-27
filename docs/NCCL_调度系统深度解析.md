@@ -40,7 +40,7 @@ nccl.all_reduce_batched(gradients)
 
 **但这引入了新问题**：用户需要手动管理批处理，代码变复杂了。
 
-### 1.2 NCCL 的解决方案：操作聚合（Operation Aggregation）
+### 1.2 NCCL 的解决方案：操作聚合（Aggregatied Operation）
 
 NCCL 提供了一个优雅的解决方案：**调度系统（Scheduler）+ Planner**。
 
@@ -214,63 +214,15 @@ ncclGroupStartInternal();   // depth: 0 → 1
 taskAppend(...);            // 任务入队
 ncclGroupEndInternal();     // depth: 1 → 0 → 触发执行
 ```
-
-时序图：
-
-```mermaid
-sequenceDiagram
-    participant User as 用户代码
-    participant API as ncclEnqueueCheck
-    participant Planner as Planner
-    participant Scheduler as Scheduler
-
-    User->>API: ncclAllReduce(buf, ...)
-    API->>API: ncclGroupStartInternal()<br/>depth: 0 → 1
-    API->>Planner: taskAppend(task)
-    Planner->>Planner: 插入 collSorter
-    API->>API: ncclGroupEndInternal()<br/>depth: 1 → 0
-    Note over API: 深度降为 0，触发执行
-    API->>Scheduler: groupLaunch()
-    Scheduler-->>API: 执行完成
-    API-->>User: 返回
-```
+PS：核心逻辑其实在`ncclGroupEndInternal`（[group.cc:646](https://github.com/NVIDIA/nccl/blob/ae7aed194dc63c65d1bf5c0385ba3d68d3b64c8c/src/group.cc#L646)）
 
 ### 2.4 嵌套 Group 的支持
 
-NCCL 支持嵌套 Group，深度可以大于 1：
-
-```c
-ncclGroupStart();           // depth: 0 → 1
-  ncclAllReduce(...);       // task1 入队
-
-  ncclGroupStart();         // depth: 1 → 2
-    ncclAllReduce(...);     // task2 入队
-  ncclGroupEnd();           // depth: 2 → 1（depth > 0，不触发执行）
-
-  ncclAllReduce(...);       // task3 入队
-ncclGroupEnd();             // depth: 1 → 0（触发执行所有任务）
-```
-
-关键代码（[group.cc:669](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/group.cc#L669)）：
-
+NCCL 支持嵌套 Group，深度可以大于 1，关键代码（[group.cc:669](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/group.cc#L669)）：
 ```c
 if ((--ncclGroupDepth) > 0) goto exit;  // 如果 depth > 0，直接返回，不执行
 // 只有 depth == 0 时，才继续后续的执行逻辑
 ```
-
-### 2.5 为什么隐式 Group 也用 Group 机制？
-
-你可能会问：既然单次调用也会立即执行（depth 1 → 0），为什么还要绕一圈走 Group 机制？直接启动 kernel 不就完了？
-
-**这是 NCCL 的统一设计哲学：所有通信操作都走同一套调度逻辑。**
-
-好处：
-1. **代码路径统一**：不需要维护两套代码（单次调用一套，批量调用一套）
-2. **优化空间更大**：即使是单次调用，也可以享受 Planner 的优化（比如算法选择、通道分配）
-3. **未来可扩展**：如果以后想做自动合并优化（比如检测短时间内的多次调用），不需要改 API
-
-**关键洞察：单次调用不是"特例"，而是深度为 1 的 Group。这种统一的设计让 NCCL 的调度系统既灵活又高效。**
-
 ### 2.6 阻塞 vs 非阻塞模式
 
 在 `ncclGroupEndInternal()` 中，NCCL 支持两种执行模式：
@@ -299,8 +251,6 @@ if (ncclGroupBlocking == 0) {
   NCCLCHECKGOTO(groupLaunch(&groupJob->base, internalSimInfoPtr), ret, fail);
 }
 ```
-
----
 
 ## 第三章：Planner - 任务收集的中枢
 
@@ -446,17 +396,6 @@ Copy Engine 是 GPU 的 **DMA（Direct Memory Access）引擎**，只能做**数
 - **AllGather**：只需复制数据，无需计算 ✅
 - **AllReduce**：需要对数据求和/求最大值等，必须用 CUDA 核心计算 ❌
 
-#### 性能对比
-
-| 特性 | **kernel-based (coll)** | **Copy Engine (ceColl)** |
-|------|-------------------------|--------------------------|
-| 实现方式 | CUDA kernel | GPU DMA 硬件 |
-| kernel 启动开销 | 有（~5-10μs） | 无 |
-| CPU 参与 | 需要（启动kernel） | 不需要（纯硬件） |
-| 适用场景 | 所有场景 | 单节点 + 对称内存 + 无归约 |
-| 支持操作 | 全部 | AllGather, AlltoAll, Scatter, Gather |
-| 驱动要求 | 任意 | CUDA 12.5+ |
-| 典型延迟 | 15-20μs | 8-12μs（降低 40-50%） |
 
 **关键洞察：NCCL 会自动选择最优路径。在满足条件时使用 Copy Engine 降低延迟，否则回退到标准 kernel 路径。用户无需关心底层实现细节。**
 
@@ -471,12 +410,12 @@ Copy Engine 是 GPU 的 **DMA（Direct Memory Access）引擎**，只能做**数
 ```c
 struct ncclTaskCollSorter {
   static constexpr int UnitLog2 = 10;           // 2^10 = 1KB 单位
-  static constexpr size_t UnitSize = 1<<10;     // 1024 字节
+  static constexpr size_t UnitSize = 1<<UnitLog2;     // 1024 字节
   static constexpr int MaxLog2 = 30;            // 2^30 = 1GB 最大值
-  static constexpr size_t MaxSize = 1ull<<30;   // 1073741824 字节
+  static constexpr size_t MaxSize = 1ull<<MaxLog2;   // 1073741824 字节
   static constexpr int BitsPerPow2 = 2;         // 每个 2 次幂之间有 2^2 = 4 个桶
-  static constexpr int BinsPerPow2 = 1<<2;      // 4 个桶
-  static constexpr int BinCount = 1 + (30-10)*4; // 总共 1 + 20*4 = 81 个桶
+  static constexpr int BinsPerPow2 = 1<<BitsPerPow2;      // 4 个桶
+  static constexpr int BinCount = 1 + (MaxLog2-UnitLog2)*BinsPerPow2; // 总共 1 + 20*4 = 81 个桶
 
   struct ncclTaskColl* head;       // 全局任务链表头
   struct ncclTaskColl* tail;       // 全局任务链表尾
@@ -500,23 +439,6 @@ collSorter 使用**对数级分桶**策略，81 个桶的分布如下：
 72-75  | 256MB - 512MB   |
 76-79  | 512MB - 1GB     |
 80     | > 1GB           | 特殊桶：超大任务
-```
-
-可视化：
-
-```
-Bucket Index (Descending):
-80: [1GB+]                                             ← 最大任务
-79: [512MB - 1GB)
-78: [512MB - 1GB)
-77: [512MB - 1GB)
-76: [512MB - 1GB)
-...
-4:  [2KB - 2.5KB)
-3:  [1.5KB - 2KB)
-2:  [1.25KB - 1.5KB)
-1:  [1KB - 1.25KB)
-0:  [0 - 1KB)                                          ← 最小任务
 ```
 
 #### 插入策略：大任务优先
@@ -580,7 +502,7 @@ inline struct ncclTaskColl* ncclTaskCollSorterDequeueAll(
 ```
 时间轴：
 T0----T10--T11-----------T111
-   B    C        A
+	   B    C             A
 
 - 任务 B 完成时间：10ms
 - 任务 C 完成时间：11ms
