@@ -3,3 +3,4 @@
 *.gcov
 /coverage/
 .DS_Store
+.obsidian/
