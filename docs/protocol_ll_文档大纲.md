@@ -85,131 +85,197 @@
 
 ## 文档 02: 数据结构详解
 
+**状态**：✅ 已完成
 
 **目标**：理解 LL 的关键数据结构及其设计原因
 
 **核心问题**：
 - ncclLLFifoLine 为什么是 16 字节？为什么标志在数据之后？
-- stepLines 是什么？如何计算？
+- stepLines 是什么？如何计算？为什么是关键桥梁？
 - LL Primitives 的成员变量有哪些？与 Simple 有什么不同？
 
 **内容结构**：
 
-### ncclLLFifoLine：LL 的传输单元
+### 一、ncclLLFifoLine：LL 的传输单元
 
-**定义和内存布局**（`device.h:69-82`）
+**定义和内存布局**（`device.h:70-83`）
 - 16 字节单元：data1(4B) + flag1(4B) + data2(4B) + flag2(4B)
-- 为什么是 union？支持多种访问方式（uint32数组、uint64数组、int4向量）
+- union 的三种访问方式：结构体、uint64_t 数组、int4 向量
 
 **🔑 为什么是 16 字节？**（重点！）
-- 有效载荷只有 8 字节，为什么标志占 50%？
-- 硬件对齐考虑：
-  - 节点内：128 位 GPU 向量操作的原子性
-  - 节点间：两次 8 字节 RDMA 原子操作
-- 这个设计是性能和正确性的平衡
+- **设计起点**：readLL 返回 uint64_t（8 字节有效数据）
+- **双标志位的必要性**：
+  - RDMA 只保证 8 字节原子性
+  - 16 字节需要两次 8 字节传输
+  - 每次传输都包含数据和标志：[data1|flag1], [data2|flag2]
+- **节点内的统一**：虽然 GPU 支持 128 位原子操作，但为了统一接口也用 16 字节
+- **关键洞察**：16 字节不是为了对齐，而是在 RDMA 的 8 字节原子性约束下，保证 8 字节有效数据的完整性传输
 
 **🔑 为什么标志在数据之后？**（重点！）
-- 对比两种设计：标志→数据 vs 数据→标志
-- RDMA 部分传输场景分析
-- 核心洞察："看到标志 = 数据已完整到达"
-- 这是 LL 正确性的基石
+- 代码注释的明确说明（device.h:71-73）
+- **场景分析**：RDMA 传输被中断的情况
+  - 标志在前（错误）：可能读到旧数据
+  - 标志在后（正确）：flag2 更新 = data2 已到达
+- **天然容错**：即使网络传输不稳定，接收方也不会读到部分数据
+- **关键洞察**：标志后置是正确性的**必要条件**，不是优化
 
-### 环形缓冲区布局
+### 二、环形缓冲区布局
 
-**总大小和 stepLines 的计算**（`init.cc:697`, `prims_ll.h:335`）
-- DEFAULT_LL_BUFFSIZE 的计算公式和默认值（512KB）
-- stepLines 的含义：每个 step 包含多少个 line（默认 4096）
-- 这是连接数据结构和流控的关键参数
+**总大小和计算公式**（`init.cc:697`）
+- DEFAULT_LL_BUFFSIZE 的定义：
+  ```c
+  NCCL_LL_LINES_PER_THREAD(8) × NCCL_LL_MAX_NTHREADS(512) ×
+  NCCL_STEPS(8) × sizeof(ncclLLFifoLine)(16)
+  = 524,288 字节 = 512 KB
+  ```
+- 设计考虑：流水线深度、内存开销、线程并行度的平衡
 
-**与 Simple 的差异**
-- Simple：step = 一个大块（512KB连续内存）
-- LL：step = 很多小 line（4096个×16字节）
-- 这个差异导致流控机制的不同
+**stepLines：连接数据与流控的桥梁**（`prims_ll.h:335`）
+- **计算公式**：
+  ```cpp
+  stepLines = buffSizes[NCCL_PROTO_LL] / NCCL_STEPS / sizeof(ncclLLFifoLine)
+            = 524,288 / 8 / 16 = 4,096 (使用默认配置)
+  ```
+- **重要性**：
+  - 数据定位：`offset = (step % NCCL_STEPS) × stepLines`
+  - 清理范围：标志回绕时的清理边界
+  - 容量计算：每个 step 的有效数据 = `stepLines × 8` 字节
+- **为什么用 line 数量而非字节数**：LL 的所有操作都以 line 为单位
+- **关键洞察**：stepLines 是理解 LL Protocol 的关键，它连接了数据结构和流控机制
 
-**数据结构层次**（从大到小）
-- 环形缓冲区（512KB）→ Step（64KB）→ Line（16B）→ 元素（1-8B）
-- 用图示说明三层结构的关系
+**数据结构的层次关系**（从大到小）
+1. **环形缓冲区**：`buffSizes[NCCL_PROTO_LL]`（默认 512 KB），划分为 8 个 slot
+2. **Step**：每个 step = `stepLines` 个 line（默认 4,096 个），流控的基本单位
+3. **Line**：16 字节（8 字节数据 + 8 字节标志），传输的基本单位
+4. **Element**：用户数据类型，每个 line 包含 `EltPerLine` 个元素
+- **层次关系图**：用嵌套矩形展示四层结构及其关系
+- **计算示例**：使用 float32 的具体数值
 
-### LL Primitives 的成员变量
+**与 Simple Protocol 的差异**
+- Simple：step = 大块连续内存（如 512 KB）
+- LL：step = 很多小 line（4,096 个 × 16 字节）
+- 这个差异导致了不同的流控机制（预告第四章）
 
-**关键成员变量**（`prims_ll.h:17-44`）：
+### 三、LL Primitives 的成员变量
 
+**核心成员概览**（`prims_ll.h:16-44`）
+- 分类：线程信息、配置信息、Recv Connection、Send Connection
+
+**关键成员变量**：
 ```cpp
-const int stepLines;  // 每个 step 包含多少个 line（如 4096）
+const int stepLines;              // 关键桥梁参数
+const int wid;                    // Warp ID (LL 特有)
+T *userBufs[2];                   // 用户缓冲区缓存
 
-// Recv Connection 相关
-volatile uint64_t* recvConnHeadPtr = NULL;  // 指向本地 head（用于更新）
-uint64_t recvConnHead;                      // 本地 head 计数器
-
-// Send Connection 相关
-volatile uint64_t* sendConnHeadPtr = NULL;  // 指向远端 head（用于轮询）
-uint64_t sendConnHead;                      // 本地 step 计数器
-uint64_t sendConnHeadCache;                 // 缓存远端 head 值（用于 waitSend）
-
-// Step 计数器（每个连接一个）
+// Recv 连接（数组！）
+struct ncclConnInfo* recvConn;
+volatile uint64_t* recvConnHeadPtr;
+uint64_t recvConnHead;
 uint64_t recvStep[MaxRecv];
-uint64_t sendStep[MaxSend];
-
-// 环形缓冲区指针（ncclLLFifoLine* 类型）
 union ncclLLFifoLine* recvBuff[MaxRecv];
+
+// Send 连接（数组！）
+struct ncclConnInfo* sendConn;
+volatile uint64_t* sendConnHeadPtr;
+uint64_t sendConnHead;
+uint64_t sendConnHeadCache;
+uint64_t sendStep[MaxSend];
 union ncclLLFifoLine* sendBuff[MaxSend];
 ```
 
-**辅助函数**：
-- `recvOffset(i)` / `sendOffset(i)`：计算当前 step 的 offset（`(step % NCCL_STEPS) * stepLines`）
+**为什么需要数组？**
+- LL Primitives 的一个实例可能同时处理多个连接
+- Ring AllReduce：需要独立追踪 recv 和 send 的进度
+- 每个连接需要独立的 step 计数器和缓冲区
+
+**recv 和 send 的分离**
+- LL 的 recv 和 send 有不同的同步机制（预告第四章）
+- recv 侧：读取后更新 head
+- send 侧：发送前轮询 head + 维护缓存
+
+**辅助函数：从 step 到 line 的映射**（`prims_ll.h:39-44`）
+- `recvOffset(i)` / `sendOffset(i)`：计算 slot 内的 offset（以 line 为单位）
+  - 公式：`(step % NCCL_STEPS) × stepLines`
+  - 为什么需要 % NCCL_STEPS：step 单调递增，需要映射到 0-7 的 slot
 - `recvPtr(i)` / `sendPtr(i)`：获取当前 step 的起始 line 指针
-- `recvFlag(i)` / `sendFlag(i)`：计算期望的标志值（`NCCL_LL_FLAG(step+1)`）
+- `recvFlag(i)` / `sendFlag(i)`：计算期望的标志值
+  - 为什么是 step + 1：标志代表"这是 step X 的数据"
 
-**与 Simple 的对比**：
+**与 Simple Primitives 的对比**
 
-| 字段 | Simple Primitives | LL Primitives |
-|------|-------------------|---------------|
-| 缓冲区指针类型 | `T* connEltsFifo` | `ncclLLFifoLine* recvBuff/sendBuff` |
-| 大小计算 | `stepSize`（元素个数） | `stepLines`（line 个数） |
-| step 计数器 | `step`（单个） | `recvStep[]`/`sendStep[]`（数组） |
-| 缓存机制 | `connStepCache` | `sendConnHeadCache` |
+| 维度 | Simple Primitives | LL Primitives | 设计原因 |
+|------|-------------------|---------------|----------|
+| 缓冲区指针类型 | `T* connEltsFifo` | `ncclLLFifoLine* recvBuff[]`、`sendBuff[]` | LL 的传输单元是 line，不是元素 |
+| 缓冲区数量 | 单个指针 | recv/send 数组 | LL 需要为多个 peer 维护独立缓冲区 |
+| step 计数器 | `uint64_t step` | `uint64_t recvStep[]`、`sendStep[]` | LL 为每个连接维护独立 step |
+| head 指针 | `uint64_t *connStepPtr` | `volatile uint64_t* recvConnHeadPtr`、`sendConnHeadPtr` | LL 分离 recv/send 逻辑 |
+| head 计数器 | 无（直接用 step） | `uint64_t recvConnHead`、`sendConnHead` | LL 需要额外的 head 管理（无 tail） |
+| head 缓存 | `uint64_t connStepCache` | `uint64_t sendConnHeadCache` | LL 只缓存发送侧的 head |
+| 大小计算 | `stepSize`（元素个数） | `stepLines`（line 个数） | 反映传输单元的差异 |
+| warp 管理 | 无 `wid` | `const int wid` | LL 需要 warp-level 操作 |
 
-**关键洞察**：
-- LL 的缓冲区指针是 `ncclLLFifoLine*`，而 Simple 是 `T*`（元素类型）
-- `stepLines` 是连接数据结构和流控的**桥梁**
-- LL 为每个连接维护独立的 step 计数器（`recvStep[]`/`sendStep[]`）
+**关键差异**：
+1. Per-connection vs Global：LL 用数组管理多个连接
+2. 指针类型：LL 指向 line 结构，Simple 指向元素类型
+3. head 管理：LL 更复杂（因为没有 tail，依赖 line 级标志）
 
-### EltPerLine：元素到 Line 的映射
+**为什么 LL 更复杂？**
+- 细粒度传输的需求
+- 每个 line 独立验证
+- recv/send 逻辑分离
 
-**定义**（`prims_ll.h:130`）：
+### 四、EltPerLine：元素到 Line 的映射
+
+**定义和计算**（`prims_ll.h:130`）：
 ```cpp
 static constexpr int EltPerLine = sizeof(uint64_t) / sizeof(T);
 ```
+- **含义**：每个 line 可以容纳多少个类型为 T 的元素
+- **为什么是 8 / sizeof(T)**：每个 line 携带 8 字节有效数据
+- **编译时常量**：constexpr，在编译时计算
 
-**含义**：每个 line 可以容纳多少个元素
+**不同数据类型的 EltPerLine**：
+- `float32`：`8 / 4 = 2`（每个 line 2 个 float）
+- `float16`：`8 / 2 = 4`（每个 line 4 个 half）
+- `int8`：`8 / 1 = 8`（每个 line 8 个 byte）
+- `float64`：`8 / 8 = 1`（每个 line 1 个 double）
 
-**例子**：
-- `float32`：`EltPerLine = 8 / 4 = 2`（每个 line 2 个 float）
-- `int8`：`EltPerLine = 8 / 1 = 8`（每个 line 8 个 int8）
-- `float16`：`EltPerLine = 8 / 2 = 4`（每个 line 4 个 float16）
+**重要性**：
+- LLGenericOp 主循环的粒度（第五章详解）
+- 决定循环迭代次数：总元素数 / EltPerLine
+- 连接用户数据和 LL Protocol 传输单元的桥梁
 
-**重要性**：这是 LLGenericOp 主循环的粒度（留到 05 详解）
+**关键洞察**：EltPerLine 告诉我们"一个 line 能装多少用户数据"
 
 ### 总结
 
-**数据结构层次**（从大到小）：
-1. **环形缓冲区**：512KB（8 个 step）
-2. **Step**：64KB（4096 个 line）
-3. **Line**：16 字节（8 字节数据 + 8 字节标志）
-4. **元素**：1-8 字节（取决于数据类型）
+**数据结构的精髓**：
+- 四层嵌套，层层递进：环形缓冲区 → Step → Line → Element
+- 每层都有明确的职责和作用
+- stepLines 和 EltPerLine 是连接不同层次的关键参数
 
-**关键洞察**：
-- 标志后置是 LL 正确性的**基石**
-- `stepLines` 是连接数据结构和流控的**桥梁**
-- LL 的数据结构比 Simple 更细粒度，但概念更清晰
+**关键洞察汇总**：
+1. **16 字节 line**：在 RDMA 的 8 字节原子性约束下，保证 8 字节数据的完整性传输
+2. **标志后置**：正确性的必要条件，天然容错机制
+3. **stepLines**：连接数据结构和流控的桥梁，理解 LL 的关键
+4. **数组管理**：支撑多连接并行处理的基础
+5. **recv/send 分离**：不同的同步机制（第四章详解）
+
+**引出下一章**：
+- 双标志位机制如何具体工作？
+- storeLL 和 readLL 的实现细节
+- 节点内和节点间的差异
+- Proxy 线程的作用
 
 **代码验证位置**：
-- `src/include/device.h:69-82` (ncclLLFifoLine 定义)
-- `src/device/prims_ll.h:17-44` (Primitives 成员变量)
-- `src/init.cc:697` (DEFAULT_LL_BUFFSIZE)
-- `src/device/prims_ll.h:335` (stepLines 计算)
+- ncclLLFifoLine：[device.h:70-83](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/device.h#L70-L83)
+- DEFAULT_LL_BUFFSIZE：[init.cc:697](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/init.cc#L697)
+- stepLines 计算：[prims_ll.h:335](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L335)
+- LL Primitives 成员：[prims_ll.h:16-44](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L16-L44)
+- 辅助函数：[prims_ll.h:39-44](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L39-L44)
+- EltPerLine：[prims_ll.h:130](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L130)
 
-**预计篇幅**：800-1000 行
+**实际篇幅**：约 900 行（符合预期）
 
 ---
 
@@ -830,8 +896,8 @@ while (nelem > 0) {
 
 ## 进度跟踪
 
-- [ ] 文档 01: LL Protocol 概览（800-1000 行）
-- [ ] 文档 02: 数据结构详解（800-1000 行）**【新增】**
+- [x] 文档 01: LL Protocol 概览（800-1000 行）
+- [x] 文档 02: 数据结构详解（~900 行）✅ **已完成并验证**
 - [ ] 文档 03: 双标志位机制详解（700-900 行）
 - [ ] 文档 04: 流控机制 - 两层防护（800-1000 行，包含标志回绕）
 - [ ] 文档 05: 把所有拼图拼起来（700-900 行）
