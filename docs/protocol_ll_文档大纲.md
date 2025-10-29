@@ -40,7 +40,6 @@
 - **小消息的延迟困境**
   - Simple Protocol 的"等待累积"问题
   - 延迟对深度学习训练的影响（Tensor Parallel 的例子）
-  - 具体数值：96 层 Transformer 的累积延迟
 - **关键洞察**：小消息需要"不等待、立即发送"的机制
 
 ### LL Protocol 是什么？
@@ -53,18 +52,18 @@
   - 双重保护：双标志位（**不讲实现**，留到 03）
 
 ### 核心机制概览（高层次，点到为止）
-- **细粒度传输**：按 16 字节逐个传输（vs Simple 的 512KB 大块）
+- **细粒度传输**：按 16 字节逐个传输（对比 Simple 的大块发送）
 - **两层同步机制**：
   - Line 级标志验证：每个 16 字节都有完整性保证
   - Step 级流控：防止"绕圈追尾"
 - **带宽-延迟权衡**：
-  - 50% 带宽（8 字节数据 + 8 字节标志）
-  - 最低延迟（3-5us vs Simple 的 25-30us）
+  - 每一段用户数据都伴随标志位 → 带宽利用率下降
+  - 粒度更细 → 等待时间显著缩短
 
 ### 适用场景
-- **LL Protocol**：小消息（< 32KB）
-- **Simple Protocol**：大消息（> 512KB）
-- **为什么不统一？**：不同场景的优化目标不同
+- **LL Protocol**：为短小数据段准备
+- **Simple Protocol**：负责长大数据段
+- **为什么不统一？**：不同消息规模下的优化目标不同
 
 ### 总结
 - LL 的本质：**用 50% 带宽换取最低延迟**
@@ -72,7 +71,7 @@
 
 **关键洞察**：
 - LL 的本质是"不等待、立即发送"
-- 细粒度 = 低延迟，代价是带宽损失
+- 细粒度带来低延迟，同时引入额外标志位成本
 - 完整性保证是核心挑战（需要双标志位机制）
 
 **代码位置**：
@@ -87,321 +86,201 @@
 
 **状态**：✅ 已完成
 
-**目标**：理解 LL 的关键数据结构及其设计原因
+**目标**：建立 LL Protocol 的"数据地图"——一个清晰的、层次化的数据结构视图
 
 **核心问题**：
-- ncclLLFifoLine 为什么是 16 字节？为什么标志在数据之后？
-- stepLines 是什么？如何计算？为什么是关键桥梁？
-- LL Primitives 的成员变量有哪些？与 Simple 有什么不同？
+- LL 的数据结构有哪些层次？（全景图）
+- 为什么是 16 字节？为什么标志在数据之后？（Line 的设计）
+- LL Primitives 的成员变量如何支撑这个数据结构？（实现细节）
 
 **内容结构**：
 
-### 一、ncclLLFifoLine：LL 的传输单元
+### 第一部分：全景图
 
-**定义和内存布局**（`device.h:70-83`）
-- 16 字节单元：data1(4B) + flag1(4B) + data2(4B) + flag2(4B)
-- union 的三种访问方式：结构体、uint64_t 数组、int4 向量
-
-**🔑 为什么是 16 字节？**（重点！）
-- **设计起点**：readLL 返回 uint64_t（8 字节有效数据）
-- **双标志位的必要性**：
-  - RDMA 只保证 8 字节原子性
-  - 16 字节需要两次 8 字节传输
-  - 每次传输都包含数据和标志：[data1|flag1], [data2|flag2]
-- **节点内的统一**：虽然 GPU 支持 128 位原子操作，但为了统一接口也用 16 字节
-- **关键洞察**：16 字节不是为了对齐，而是在 RDMA 的 8 字节原子性约束下，保证 8 字节有效数据的完整性传输
-
-**🔑 为什么标志在数据之后？**（重点！）
-- 代码注释的明确说明（device.h:71-73）
-- **场景分析**：RDMA 传输被中断的情况
-  - 标志在前（错误）：可能读到旧数据
-  - 标志在后（正确）：flag2 更新 = data2 已到达
-- **天然容错**：即使网络传输不稳定，接收方也不会读到部分数据
-- **关键洞察**：标志后置是正确性的**必要条件**，不是优化
-
-### 二、环形缓冲区布局
-
-**总大小和计算公式**（`init.cc:697`）
-- DEFAULT_LL_BUFFSIZE 的定义：
-  ```c
-  NCCL_LL_LINES_PER_THREAD(8) × NCCL_LL_MAX_NTHREADS(512) ×
-  NCCL_STEPS(8) × sizeof(ncclLLFifoLine)(16)
-  = 524,288 字节 = 512 KB
-  ```
-- 设计考虑：流水线深度、内存开销、线程并行度的平衡
-
-**stepLines：连接数据与流控的桥梁**（`prims_ll.h:335`）
-- **计算公式**：
-  ```cpp
-  stepLines = buffSizes[NCCL_PROTO_LL] / NCCL_STEPS / sizeof(ncclLLFifoLine)
-            = 524,288 / 8 / 16 = 4,096 (使用默认配置)
-  ```
-- **重要性**：
-  - 数据定位：`offset = (step % NCCL_STEPS) × stepLines`
-  - 清理范围：标志回绕时的清理边界
-  - 容量计算：每个 step 的有效数据 = `stepLines × 8` 字节
-- **为什么用 line 数量而非字节数**：LL 的所有操作都以 line 为单位
-- **关键洞察**：stepLines 是理解 LL Protocol 的关键，它连接了数据结构和流控机制
-
-**数据结构的层次关系**（从大到小）
-1. **环形缓冲区**：`buffSizes[NCCL_PROTO_LL]`（默认 512 KB），划分为 8 个 slot
-2. **Step**：每个 step = `stepLines` 个 line（默认 4,096 个），流控的基本单位
-3. **Line**：16 字节（8 字节数据 + 8 字节标志），传输的基本单位
-4. **Element**：用户数据类型，每个 line 包含 `EltPerLine` 个元素
-- **层次关系图**：用嵌套矩形展示四层结构及其关系
-- **计算示例**：使用 float32 的具体数值
-
-**与 Simple Protocol 的差异**
-- Simple：step = 大块连续内存（如 512 KB）
-- LL：step = 很多小 line（4,096 个 × 16 字节）
-- 这个差异导致了不同的流控机制（预告第四章）
-
-### 三、LL Primitives 的成员变量
-
-**核心成员概览**（`prims_ll.h:16-44`）
-- 分类：线程信息、配置信息、Recv Connection、Send Connection
-
-**关键成员变量**：
-```cpp
-const int stepLines;              // 关键桥梁参数
-const int wid;                    // Warp ID (LL 特有)
-T *userBufs[2];                   // 用户缓冲区缓存
-
-// Recv 连接（数组！）
-struct ncclConnInfo* recvConn;
-volatile uint64_t* recvConnHeadPtr;
-uint64_t recvConnHead;
-uint64_t recvStep[MaxRecv];
-union ncclLLFifoLine* recvBuff[MaxRecv];
-
-// Send 连接（数组！）
-struct ncclConnInfo* sendConn;
-volatile uint64_t* sendConnHeadPtr;
-uint64_t sendConnHead;
-uint64_t sendConnHeadCache;
-uint64_t sendStep[MaxSend];
-union ncclLLFifoLine* sendBuff[MaxSend];
+**四层嵌套结构**（从大到小）：
+```
+环形缓冲区（默认值由 `DEFAULT_LL_BUFFSIZE` 给出）
+  ↓ 包含 `NCCL_STEPS` 个 slot
+Step（大小 = 缓冲区大小 / `NCCL_STEPS`，包含 `stepLines` 个 line）
+  ↓ `stepLines` 是以 line 为单位的步长
+Line（16 字节：8B 数据 + 8B 标志，见 `ncclLLFifoLine`）
+  ↓ 包含 `EltPerLine` 个元素
+Element（sizeof(T)）
 ```
 
-**为什么需要数组？**
-- LL Primitives 的一个实例可能同时处理多个连接
-- Ring AllReduce：需要独立追踪 recv 和 send 的进度
-- 每个连接需要独立的 step 计数器和缓冲区
+**关键参数速查表**：
+- `DEFAULT_LL_BUFFSIZE`：默认环形缓冲区大小（宏展开可得 512KB）
+- `NCCL_STEPS`：环形缓冲区 slot 数量
+- `stepLines`：每个 step 的 line 数量（`buffSizes[NCCL_PROTO_LL] / NCCL_STEPS / sizeof(ncclLLFifoLine)`）
+- `sizeof(ncclLLFifoLine)`：16 字节（代码定义）
+- `EltPerLine`：`sizeof(uint64_t) / sizeof(T)`（每个 line 的元素数量）
 
-**recv 和 send 的分离**
-- LL 的 recv 和 send 有不同的同步机制（预告第四章）
-- recv 侧：读取后更新 head
-- send 侧：发送前轮询 head + 维护缓存
+**层次关系与职责**：
+- **环形缓冲区**：支持流水线传输
+- **Step**：流控的粗粒度单位
+- **Line**：传输和验证的细粒度单位
+- **Element**：用户数据
 
-**辅助函数：从 step 到 line 的映射**（`prims_ll.h:39-44`）
-- `recvOffset(i)` / `sendOffset(i)`：计算 slot 内的 offset（以 line 为单位）
-  - 公式：`(step % NCCL_STEPS) × stepLines`
-  - 为什么需要 % NCCL_STEPS：step 单调递增，需要映射到 0-7 的 slot
-- `recvPtr(i)` / `sendPtr(i)`：获取当前 step 的起始 line 指针
-- `recvFlag(i)` / `sendFlag(i)`：计算期望的标志值
-  - 为什么是 step + 1：标志代表"这是 step X 的数据"
+### 第二部分：逐层深入
 
-**与 Simple Primitives 的对比**
+#### 1. 环形缓冲区
+- **总大小计算**：`DEFAULT_LL_BUFFSIZE` 的公式与设计考虑
+- **为什么是 512 KB**：流水线深度、内存开销、线程并行度的权衡
+- **如何获取**：通过 `ncclShmem.comm.buffSizes[NCCL_PROTO_LL]` 访问
 
-| 维度 | Simple Primitives | LL Primitives | 设计原因 |
-|------|-------------------|---------------|----------|
-| 缓冲区指针类型 | `T* connEltsFifo` | `ncclLLFifoLine* recvBuff[]`、`sendBuff[]` | LL 的传输单元是 line，不是元素 |
-| 缓冲区数量 | 单个指针 | recv/send 数组 | LL 需要为多个 peer 维护独立缓冲区 |
-| step 计数器 | `uint64_t step` | `uint64_t recvStep[]`、`sendStep[]` | LL 为每个连接维护独立 step |
-| head 指针 | `uint64_t *connStepPtr` | `volatile uint64_t* recvConnHeadPtr`、`sendConnHeadPtr` | LL 分离 recv/send 逻辑 |
-| head 计数器 | 无（直接用 step） | `uint64_t recvConnHead`、`sendConnHead` | LL 需要额外的 head 管理（无 tail） |
-| head 缓存 | `uint64_t connStepCache` | `uint64_t sendConnHeadCache` | LL 只缓存发送侧的 head |
-| 大小计算 | `stepSize`（元素个数） | `stepLines`（line 个数） | 反映传输单元的差异 |
-| warp 管理 | 无 `wid` | `const int wid` | LL 需要 warp-level 操作 |
+#### 2. Step（流控单元）
+- **每个 step 的大小**：`buffSizes[NCCL_PROTO_LL] / NCCL_STEPS`
+- **stepLines：桥梁参数** ⭐
+  - 计算公式：`buffSizes[NCCL_PROTO_LL] / NCCL_STEPS / sizeof(ncclLLFifoLine)`
+  - 三个关键作用：数据定位、容量计算、清理范围
+  - 为什么以 line 为单位：LL 的所有操作都是 line 级的
+- **从 step 到 offset**：`offset = (step % NCCL_STEPS) × stepLines`
 
-**关键差异**：
-1. Per-connection vs Global：LL 用数组管理多个连接
-2. 指针类型：LL 指向 line 结构，Simple 指向元素类型
-3. head 管理：LL 更复杂（因为没有 tail，依赖 line 级标志）
+#### 3. Line（传输单元）⭐
+- **ncclLLFifoLine 的定义**：16 字节 union（三种访问方式）
+- **为什么是 16 字节？** ⭐
+  - 设计起点：readLL 返回 uint64_t（8 字节有效数据）
+  - RDMA 的 8 字节原子性约束 → 需要双标志位
+  - 每次 8 字节传输都包含"数据 + 标志"
+  - 节点内也用 16 字节：统一接口
+- **为什么标志在数据之后？** ⭐
+  - RDMA 传输容错：防止中断时读到部分数据
+  - 保证：看到 flag 更新 = data 一定已到达
+  - 这是正确性的必要条件
+- **readLL/storeLL 简介**：原子读写的基础（第三章详解）
 
-**为什么 LL 更复杂？**
-- 细粒度传输的需求
-- 每个 line 独立验证
-- recv/send 逻辑分离
+#### 4. Element（用户数据）
+- **EltPerLine 的计算**：`sizeof(uint64_t) / sizeof(T)`
+- **不同数据类型的映射**：float32(2)、float16(4)、int8(8)、float64(1)
+- **与主循环的关系**：决定循环粒度（第五章详解）
 
-### 四、EltPerLine：元素到 Line 的映射
+### 第三部分：LL Primitives 的成员变量
 
-**定义和计算**（`prims_ll.h:130`）：
-```cpp
-static constexpr int EltPerLine = sizeof(uint64_t) / sizeof(T);
-```
-- **含义**：每个 line 可以容纳多少个类型为 T 的元素
-- **为什么是 8 / sizeof(T)**：每个 line 携带 8 字节有效数据
-- **编译时常量**：constexpr，在编译时计算
+**为什么需要这些成员？**
+- 支撑四层数据结构
+- 处理多连接、线程并行、流控
 
-**不同数据类型的 EltPerLine**：
-- `float32`：`8 / 4 = 2`（每个 line 2 个 float）
-- `float16`：`8 / 2 = 4`（每个 line 4 个 half）
-- `int8`：`8 / 1 = 8`（每个 line 8 个 byte）
-- `float64`：`8 / 8 = 1`（每个 line 1 个 double）
+**核心成员分类**：
+1. **线程信息**：tid, nthreads, wid, group
+2. **配置信息**：stepLines（关键！）, fan, userBufs
+3. **Recv 连接**：recvConn, recvConnHead, recvStep[], recvBuff[]
+4. **Send 连接**：sendConn, sendConnHead, sendStep[], sendBuff[]
 
-**重要性**：
-- LLGenericOp 主循环的粒度（第五章详解）
-- 决定循环迭代次数：总元素数 / EltPerLine
-- 连接用户数据和 LL Protocol 传输单元的桥梁
+**关键设计特点**：
+- **数组管理**：recvStep[]/sendStep[] 支持多连接并行
+- **recv/send 分离**：不同的同步机制（LL 没有 tail，只有 head）
+- **指针类型**：ncclLLFifoLine*（vs Simple 的 T*）
 
-**关键洞察**：EltPerLine 告诉我们"一个 line 能装多少用户数据"
+**辅助函数**（step → line 的映射）：
+- `recvOffset(i)` / `sendOffset(i)`：计算 offset
+- `recvPtr(i)` / `sendPtr(i)`：获取 line 指针
+- `recvFlag(i)` / `sendFlag(i)`：计算期望标志值
 
-### 总结
+**与 Simple Primitives 的核心差异**：
+- 传输单元：T* vs ncclLLFifoLine*
+- step 管理：单个计数器 vs 数组
+- 同步机制：tail/head vs 只有 head
+
+### 总结与关键洞察
 
 **数据结构的精髓**：
-- 四层嵌套，层层递进：环形缓冲区 → Step → Line → Element
-- 每层都有明确的职责和作用
-- stepLines 和 EltPerLine 是连接不同层次的关键参数
+- 四层嵌套，层层递进，每层职责明确
+- stepLines 和 EltPerLine 连接不同层次
 
-**关键洞察汇总**：
-1. **16 字节 line**：在 RDMA 的 8 字节原子性约束下，保证 8 字节数据的完整性传输
-2. **标志后置**：正确性的必要条件，天然容错机制
-3. **stepLines**：连接数据结构和流控的桥梁，理解 LL 的关键
-4. **数组管理**：支撑多连接并行处理的基础
-5. **recv/send 分离**：不同的同步机制（第四章详解）
+**核心要点**：
+1. **16 字节设计**：RDMA 8B 原子性 → 双标志位 → 标志后置
+2. **stepLines 的桥梁作用**：连接数据结构和流控
+3. **数组管理**：支撑多连接并行
+4. **recv/send 分离**：LL 的同步机制特点
 
 **引出下一章**：
-- 双标志位机制如何具体工作？
-- storeLL 和 readLL 的实现细节
+- 双标志位机制如何工作？
+- storeLL/readLL 的实现
 - 节点内和节点间的差异
-- Proxy 线程的作用
+- 标志回绕与清理
 
-**代码验证位置**：
-- ncclLLFifoLine：[device.h:70-83](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/device.h#L70-L83)
-- DEFAULT_LL_BUFFSIZE：[init.cc:697](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/init.cc#L697)
-- stepLines 计算：[prims_ll.h:335](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L335)
-- LL Primitives 成员：[prims_ll.h:16-44](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L16-L44)
-- 辅助函数：[prims_ll.h:39-44](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L39-L44)
-- EltPerLine：[prims_ll.h:130](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll.h#L130)
+**Appendix**：ncclShmem 的作用（共享内存中的全局配置）
 
-**实际篇幅**：约 900 行（符合预期）
+**实际篇幅**：约 1050 行（含 Appendix）
 
 ---
 
 ## 文档 03: 双标志位机制详解
 
-**状态**：待写
+**状态**：✅ 已完成
 
 **目标**：深入理解 LL 如何使用双标志位保证数据完整性
 
 **核心问题**：
-- 为什么需要两个标志位？一个不够吗？
-- 节点内和节点间通信有什么差异？
-- 如何保证接收方不会读到"部分数据"？
+- storeLL 如何保证"写入是原子的"？
+- readLL 如何保证"读到的是完整数据"？
+- 节点内和节点间有什么差异？
 
 **内容结构**：
 
-### 问题的本质：原子性的挑战
-- **节点内通信**：GPU 硬件保证 128 位向量操作原子性
-- **节点间通信**：RDMA 只保证 8 字节原子性
-- **核心问题**：如何用 8 字节原子性实现 16 字节完整性？
+### 第一部分：从问题出发 - 为什么需要双标志位？
+- **场景设定**：一个 line 的旅程（GPU 0 → GPU 1）
+- **storeLL 和 readLL 的定义**：发送方和接收方的核心函数
+- **通信流程**：数据准备 → storeLL → 传输 → readLL → step 递增
+- **原子性的约束**：
+  - 无论节点内还是节点间，NCCL 只依赖 8 字节原子性（参考 `device.h` 的注释）
+  - 核心问题：如何在只具备 8 字节原子性的情况下传输 16 字节 line？
 
-### 节点内通信：GPU 原子操作
+### 第二部分：storeLL - 如何写入一个 line？
+- **设计目标**：节点内一条指令，节点间统一接口
+- **实现**：PTX 向量写指令（`st.volatile.global.v4.u32`）
+- **为什么是 16 字节？为什么参数顺序是 data1, flag1, data2, flag2？**
+  - 方案 A（效率低）：8 字节 line → 控制开销翻倍
+  - 方案 B（错误）：先数据后标志 → RDMA 乱序时数据完整性被破坏
+  - 正确方案：data1, flag1, data2, flag2 → 每个 8 字节写都有"就地确认"
+- **内存可见性**：没有显式 `__threadfence()`，依赖 `volatile` 写入与 Proxy 轮询
 
-**storeLL 的实现**（`prims_ll.h:126-128`）：
-```cpp
-__device__ void storeLL(union ncclLLFifoLine* dst, uint64_t val, uint32_t flag) {
-  asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};"
-    :: "l"(&dst->i4),
-       "r"((uint32_t)val),      // data1
-       "r"(flag),                // flag1
-       "r"((uint32_t)(val>>32)), // data2
-       "r"(flag)                 // flag2
-    : "memory");
-}
-```
-- **PTX 指令**：`st.volatile.global.v4.u32`（一条指令写入 4 个 uint32）
-- **参数顺序**：data1, flag1, data2, flag2（与 ncclLLFifoLine 布局一致）
-- **原子性保证**：GPU 硬件保证 128 位向量操作的原子性
-
-**readLL 的实现**（`prims_ll.h:89-100`）：
-```cpp
-__device__ uint64_t readLL(int offset, int i) {
-  union ncclLLFifoLine* src = recvPtr(i) + offset;
-  uint32_t flag = recvFlag(i);  // 期望的标志值
-  uint32_t data1, flag1, data2, flag2;
-  int spins = 0;
-  do {
-    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
-      : "=r"(data1), "=r"(flag1), "=r"(data2), "=r"(flag2)
-      : "l"(&src->i4) : "memory");
-    if (checkAbort(abort, 1, spins)) break;
-  } while ((flag1 != flag) || (flag2 != flag));
-  uint64_t val64 = data1 + (((uint64_t)data2) << 32);
-  return val64;
-}
-```
-- **PTX 指令**：`ld.volatile.global.v4.u32`（一条指令读取 4 个 uint32）
+### 第三部分：readLL - 如何验证数据完整性？
+- **Flag 的计算**：step 到 flag 的映射
+  - `recvFlag(i) = NCCL_LL_FLAG(recvStep[i] + 1)`
+  - 为什么是 `step + 1`？（flag 是"下一个 step"的版本号）
+  - step 递增的时机（发送方：storeLL 之后；接收方：readLL 之后）
+- **实现**：PTX 向量读指令（`ld.volatile.global.v4.u32`）+ 自旋循环
 - **自旋条件**：`(flag1 != flag) || (flag2 != flag)`
-- **为什么需要自旋？**：GPU 不能"睡眠"，只能忙等待
-- **为什么检查两个标志？**：双重保护（即使节点内也需要，为了统一接口）
+- **为什么需要自旋？为什么检查两个标志？**
 
-**为什么节点内还需要双标志位？**
-- **统一接口**：节点内和节点间使用相同的 storeLL/readLL
-- **简化实现**：不需要针对不同场景使用不同的代码路径
-- **防御性设计**：即使硬件保证原子性，软件也提供双重验证
+### 第四部分：节点内通信 - 只依赖 8 字节原子性
+- **数据流**：storeLL 写入 16 字节（底层拆分成两个 8 字节写）→ readLL 轮询
+- **时序图**：展示两次 8 字节传输的顺序到达
+- **为什么节点内也需要双标志位？**
+  - 统一接口（不需要针对不同场景使用不同代码）
+  - 防御性设计（软件双重验证）
+  - 检查两个标志的开销很小
 
-### 节点间通信：RDMA 的 8 字节原子性
+### 第五部分：节点间通信 - RDMA 的挑战
+- **发送路径的三个阶段**：
+  1. GPU 写本地缓冲区（同样只依赖 8 字节原子性）
+  2. **Proxy 线程验证标志**（关键！）：
+     - 为什么需要？GPU 写入并不天然对 CPU/RDMA 可见
+     - Proxy 做什么？CPU 线程轮询验证所有 line 的标志
+     - 验证失败怎么办？`ready = 0`，RDMA 不发送，下次重试
+  3. RDMA 传输（分两次 8 字节传输）
+- **接收路径**：readLL 自旋等待双标志位
+- **时序图**：展示 Proxy 验证、RDMA 传输、readLL 自旋的配合
+- **网络中断的容错**：接收方不会读到部分数据，天然容错
 
-**发送路径的三个阶段**：
+### 总结与关键洞察
+- 双标志位机制的精髓：
+  1. storeLL：一条 PTX 指令写入 16 字节，数据和标志交错排列
+  2. readLL：自旋等待双标志位，只返回有效数据
+  3. Flag 的计算：step 的"版本号"，确保读到的是当前 step 的数据
+  4. Proxy 的作用：GPU-CPU 内存一致性的桥梁，验证失败 → RDMA 不发送
+- **双标志位不是"重复验证"，而是为两个半行数据建立"就地确认"信号**
+- **What's Next？**line 级完整性保证还不够，需要 step 级流控防止"绕圈追尾"
 
-1. **阶段 1：GPU 写本地缓冲区**
-   - 调用 `storeLL()`，写入 16 字节到本地 GPU 内存
-   - 使用 128 位原子操作
+**代码验证位置**：
+- `src/device/prims_ll.h:126-128` (storeLL 实现)
+- `src/device/prims_ll.h:89-99` (readLL 实现)
+- `src/device/prims_ll.h:43-44` (recvFlag/sendFlag 定义)
+- `src/transport/net.cc:1296-1303` (Proxy 验证逻辑)
+- `src/include/device.h:71-74` (RDMA 8 字节原子性注释)
 
-2. **阶段 2：Proxy 线程验证标志**（`net.cc:1296-1303`）
-   ```cpp
-   uint32_t flag = NCCL_LL_FLAG(sub->base + sub->transmitted + 1);
-   int nFifoLines = DIVUP(size, sizeof(union ncclLLFifoLine));
-   union ncclLLFifoLine* lines = (union ncclLLFifoLine*)buff;
-   for (int i=0; i<nFifoLines; i++) {
-     volatile uint32_t *f1 = &lines[i].flag1;
-     volatile uint32_t *f2 = &lines[i].flag2;
-     if (f1[0] != flag || f2[0] != flag) { ready = 0; break; }
-   }
-   ```
-   - **为什么需要？**：GPU 的 `__threadfence()` 只保证 GPU 内可见
-   - **Proxy 做什么？**：CPU 线程轮询验证所有 line 的标志
-   - **验证通过后**：才允许 RDMA 发送
-
-3. **阶段 3：RDMA 传输**
-   - RDMA 只保证 8 字节原子性
-   - 16 字节需要两次 8 字节传输：
-     - 第一次：data1 + flag1（前 8 字节）
-     - 第二次：data2 + flag2（后 8 字节）
-
-**接收路径**：
-- GPU 调用 `readLL()`，自旋等待双标志位
-- **时序图**：展示标志后置的保护作用
-  - 场景 1：只有前 8 字节到达 → flag2 不匹配 → 继续等待 ✅
-  - 场景 2：16 字节完整到达 → flag1 和 flag2 都匹配 → 读取数据 ✅
-
-**网络中断的容错**：
-- **问题**：第一个 8 字节到达，第二个 8 字节延迟（网络拥塞、丢包重传）
-- **LL 的处理**：接收方看到 flag1 但 flag2 不匹配 → 继续等待
-- **关键洞察**：接收方不会读到部分数据，**天然容错**
-
-### Proxy 验证的必要性
-
-**问题**：为什么 GPU 的 `__threadfence()` 不够？
-- `__threadfence()` 只保证 GPU 内存的可见性
-- 不保证对 CPU 或远端 GPU 的可见性
-- RDMA 可能读到未完全刷新的数据
-
-**解决方案**：CPU/Proxy 线程轮询验证
-- Proxy 是 CPU 线程，读取 GPU 内存
-- 如果 CPU 能看到标志，说明数据已刷新到系统内存
-- 这是 GPU-CPU 内存一致性的桥梁
-
-**验证逻辑**（`net.cc:1296-1303`）：
-- 遍历所有 line，检查 flag1 和 flag2
-- 只有**全部匹配**才允许 RDMA 发送
-- 如果有任何一个不匹配，`ready = 0`，等待下次轮询
-
-
-
-**预计篇幅**：700-900 行
+**实际篇幅**：约 800 行
 
 ---
 
@@ -543,12 +422,12 @@ inline __device__ uint32_t sendFlag(int i) { return NCCL_LL_FLAG(sendStep[i]+1);
 
 **场景分析**：
 - step 0: flag = 0
-- step 4294967296: flag = 0（回绕）
+- step 增长到 2^32 时：flag 重新回到 0
 - 接收方如何区分"新的 flag=0"和"旧的 flag=0"？
 
 **潜在的错误**：
 - 旧数据（step 0）还在缓冲区中
-- 新数据（step 4294967296）写入相同位置
+- 新数据（step 达到 2^32）写入相同位置
 - 接收方看到 flag=0，但不知道是新数据还是旧数据
 
 #### 清理机制
@@ -566,10 +445,11 @@ if ((sendStep[i] & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK) {
 }
 ```
 
-**触发频率**：
-- `0x7ffffff8 = 0111 1111 1111 1111 1111 1111 1111 1000`（二进制）
-- 当 sendStep 的低 31 位全为 1 时触发
-- 约每 2^31 步触发一次（远早于 2^32 溢出）
+**触发时刻怎么理解？**
+- `0x7ffffff8 = 0111 1111 1111 1111 1111 1111 1111 1000`（二进制，下标从 bit0 开始）
+- 条件 `(sendStep[i] & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK` 要求 **bit3-bit30 全为 1**，bit0-bit2 可任意，较高位不受约束
+- 换句话说：`sendStep[i] mod 2^31` 处于 `0x7ffffff8` ~ `0x7fffffff` 之间时触发
+- 这是连续的 8 个 step（与 `NCCL_STEPS = 8` 对齐），每经过 `2^31` 个 step 会重复一次清理窗口
 
 **清理操作**（`prims_ll.h:83-85`）：
 - 遍历当前 step 的所有 line（`stepLines`）
@@ -579,7 +459,7 @@ if ((sendStep[i] & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK) {
 #### 为什么这样设计？
 
 **预防性清理**：
-- 在回绕之前（2^31）清除旧标志
+- 在 flag 低 32 位即将回绕前（每 `2^31` 步）批量刷新所有 slot
 - 确保旧数据的标志不会与新数据混淆
 
 **掩码是 NCCL_STEPS 的倍数**：
@@ -606,7 +486,7 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 ```
 
 **目的**：更快触发清理，用于测试
-- 清理触发频率：每 120 步（vs 正常模式的 2^31 步）
+- 清理触发窗口：`sendStep mod 2^7 ∈ [0x78, 0x7F]`（即每 128 步出现一次、连续 8 个 step）
 - 标志回绕频率：每 256 步（vs 正常模式的 2^32 步）
 
 ### 总结
@@ -651,19 +531,19 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 
 **设计理念**：
 - **避免引入新概念**：不讲 LLGenericOp 实现细节的每一行
-- **用具体数值**：4 个 GPU、4KB 数据、1024 个 float、512 个 line
-- **聚焦单个实例**：只追踪 GPU 0 在 Reduce-Scatter 第一步的行为
+- **用可验证的配置**：选取一个默认宏定义下的 ring 场景，追踪有限数量的 line
+- **聚焦单个实例**：只追踪某个 GPU 在 Reduce-Scatter 第一步的行为
 - **大量回顾**：频繁引用前四章的概念，展示它们如何连接
 
 **内容结构**：
 
 ### 场景设置
-- **硬件配置**：4 个 GPU、NVLink 连接、P2P 访问
-- **数据量**：4KB/GPU（1024 个 float）
-- **环形缓冲区**：512KB 总大小、8 个 step、每个 step 4096 个 line
-- **线程配置**：256 个线程（所有线程都参与数据传输）
-- **Ring AllReduce 数据划分**：4 个 chunk，每个 chunk 256 个 float = 512 个 line
-- **本章聚焦点**：GPU 0 在 Reduce-Scatter 步骤 1 的完整流程
+- **硬件配置**：单节点多 GPU，支持 NVLink/PCIe P2P
+- **数据量**：沿用默认切分参数（chunk/slice 与前文一致）
+- **环形缓冲区**：引用默认宏（`DEFAULT_LL_BUFFSIZE`、`NCCL_STEPS`、`stepLines`）
+- **线程配置**：使用 `ncclParamNthreads()` 和 `NCCL_LL_MAX_NTHREADS` 的默认组合
+- **Ring AllReduce 数据划分**：沿用调度系统中的默认 chunk/slice 规划
+- **本章聚焦点**：固定某个 GPU 在 Reduce-Scatter 首轮的完整流程
 
 ### 从算法到协议：调用链
 - 算法层如何调用 `prims.recvReduceSend(chunkOffset, chunkCount)`
@@ -686,8 +566,8 @@ static_assert(NCCL_LL_CLEAN_MASK % NCCL_STEPS == 0, "Invalid NCCL_LL_CLEAN_MASK 
 ### 第二阶段：数据传输 - 逐 line 处理
 
 **EltPerLine 的概念**（回顾 02）：
-- `float32`: `EltPerLine = 2`（每个 line 2 个 float）
-- 512 个 line = 1024 个 float
+- `EltPerLine = sizeof(uint64_t) / sizeof(T)`
+- 对于 float32/float16/int8，会分别形成不同的元素密度
 
 **主循环结构**（`prims_ll.h:240-285`）：
 ```cpp
@@ -719,10 +599,10 @@ while (nelem > 0) {
 ```
 
 **线程并行工作**：
-- 线程 0：处理 line 0, 256, 512, ...
-- 线程 1：处理 line 1, 257, 513, ...
-- ...
-- 线程 255：处理 line 255, 511, ...
+- 每个线程以 `offset += nthreads` 的方式在 line 空间中跳跃
+- 线程 0 负责 line 0、`nthreads`、`2*nthreads`...
+- 线程 1 负责 line 1、`1+nthreads`、`1+2*nthreads`...
+- 以此类推，覆盖整个 step
 
 **每次迭代**（以线程 0 的第一次迭代为例）：
 
@@ -741,10 +621,10 @@ while (nelem > 0) {
    - `data = applyReduce(redOp, peerData, data)`
    - 对于 AllReduce：`data = peerData + data`
 
-4. **storeLL：写入 LL 缓冲区**（回顾 03）
+ 4. **storeLL：写入 LL 缓冲区**（回顾 03）
    - 写入 `sendPtr(0) + offset`
    - 使用当前 flag：`sendFlag(0) = NCCL_LL_FLAG(sendStep[0] + 1)`
-   - 一条 PTX 指令完成 128 位原子写
+   - 一条 PTX 指令发出 16 字节写入（硬件层面拆成两个 8 字节事务）
 
 5. **写入用户缓冲区**（可选）
    - 如果 `DST` 模板参数不是 `-1`
@@ -769,7 +649,7 @@ while (nelem > 0) {
   - 告诉对方"我读完了这个 step"
 
 **粒度**：以 step 为单位（不是 line）
-- 即使处理了 512 个 line，只更新一次 head
+- 即使处理了一个 step 内的所有 line，也只更新一次 head
 
 ### DataLoader 的作用
 
@@ -791,24 +671,17 @@ while (nelem > 0) {
 
 ### 延迟和带宽分析
 
-**延迟分析**（4KB AllReduce）：
-- **LL Protocol**：3-5us
-  - 没有大块累积等待
-  - line 级立即传输
-- **Simple Protocol**：25-30us
-  - 需要累积到足够大的块
-  - waitPeer 等待时间
+**延迟视角**：
+- LL 不等待累积，storeLL 完成后立刻推进 line
+- Simple 需要凑够大块才能启动，waitPeer 会引入额外等待
 
-**带宽分析**：
-- **有效数据**：4KB
-- **标志开销**：4KB（50%）
-- **总传输**：8KB
-- **带宽利用率**：50%
+**带宽视角**：
+- 每个 8 字节数据旁边都有 8 字节标志 → 有效带宽约为原协议的一半
+- 这是 LL 的刻意取舍，用更紧凑的同步换来即时性
 
 **为什么值得？**
-- 小消息场景下，延迟比带宽更重要
-- Tensor Parallel：96 层 × 30us = 2.88ms（Simple）vs 96 层 × 4us = 0.38ms（LL）
-- 7 倍延迟改善，值得 50% 带宽损失
+- 在模型并行等小消息场景，延迟是首要瓶颈
+- LL 的细粒度机制能显著压缩等待时间，即便需要承担额外标志开销
 
 ### 处理多个 chunk：完整的 Reduce-Scatter
 
@@ -843,7 +716,7 @@ while (nelem > 0) {
 - 标志回绕：预防性清理机制
 
 **第五章的完整流程**：
-- waitSend → 逐 line 处理（512 次迭代）→ postRecv
+- waitSend → 逐 line 处理（遍历一个 step 的全部 line）→ postRecv
 - 所有零件如何精密配合
 
 **为什么能高性能？**
@@ -907,8 +780,8 @@ while (nelem > 0) {
 ## 关键差异总结（LL vs Simple）
 
 ### 传输单元
-- **Simple**：大块（512KB per step）
-- **LL**：小块（16B per line，4096 个 line per step）
+- **Simple**：大块（按 chunk/step 发射）
+- **LL**：小块（line 为基本单位）
 
 ### 同步机制
 - **Simple**：粗粒度（step 级 waitPeer/postPeer）
@@ -919,12 +792,12 @@ while (nelem > 0) {
 - **LL**：双标志位机制 + 标志后置
 
 ### 性能特点
-- **Simple**：高带宽（~100%），较高延迟（25-30us）
-- **LL**：低带宽（~50%），最低延迟（3-5us）
+- **Simple**：优先追求带宽，允许较高启动延迟
+- **LL**：牺牲部分带宽，换取更低的启动延迟
 
 ### 适用场景
-- **Simple**：大消息（> 512KB）
-- **LL**：小消息（< 32KB）
+- **Simple**：大消息
+- **LL**：小消息
 
 ### 线程分工
 - **Simple**：Wait/Worker/Post 线程分工明确

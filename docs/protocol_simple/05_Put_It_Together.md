@@ -45,11 +45,10 @@ GPU 0 → GPU 1 → GPU 2 → GPU 3 → GPU 0
 - Slot 数量：8 个（`NCCL_STEPS=8`）
 - 每个 slot：512KB = 128K 个 float
 
-**线程配置**：
-- 每个 GPU 的 kernel 有 256 个线程
-- 线程 0-1：Wait 角色（RoleWaitRecv、RoleWaitSend）
-- 线程 2-253：Worker 线程（254 个）
-- 线程 254-255：Post 角色（RolePostSend、RolePostRecv）
+**线程配置**（Simple 协议默认的 256 线程 block）：
+- `nworkers = 224`：tid 0-223 构成 worker 队列，既负责数据路径，也包括两个 Wait 线程（tid 0/1）
+- `tid 224-253`：位于额外的服务 warp，通常闲置，预留给多 peer 或特殊配置
+- `tid 254-255`：服务 warp 中的 Post 线程（RolePostSend、RolePostRecv）
 
 ### Ring AllReduce 的数据划分
 
@@ -180,12 +179,12 @@ __device__ void recvReduceSend(intptr_t inpIx, int eltN, bool postOp=false) {
 waitPeer 的任务是**确认可以进行数据传输**，并**设置好指针**。
 
 回顾第四章：waitPeer 由两个线程分别执行：
-- **RoleWaitRecv 线程**（线程 0）：等待可以从 GPU 3 接收
-- **RoleWaitSend 线程**（线程 1）：等待可以向 GPU 1 发送
+- **RoleWaitRecv 线程**（tid 0，属于 worker warp）：等待可以从 GPU 3 接收
+- **RoleWaitSend 线程**（tid 1，同样在 worker warp）：等待可以向 GPU 1 发送
 
 ### 接收方的 waitPeer
 
-**执行者**：线程 0（RoleWaitRecv）
+**执行者**：tid 0（RoleWaitRecv）
 
 **初始状态**（第一次传输）：
 ```c
@@ -261,7 +260,7 @@ GPU 0 的 ring buffer:
 
 ### 发送方的 waitPeer
 
-**执行者**：线程 1（RoleWaitSend）
+**执行者**：tid 1（RoleWaitSend）
 
 **初始状态**：
 ```c
@@ -325,7 +324,7 @@ GPU 1 的 ring buffer (通过 P2P 访问):
 
 除了 Wait 线程设置 ring buffer 指针（`srcs[1]`、`dsts[1]`）外，还需要设置用户缓冲区指针。
 
-**执行者**：线程 0（通常是第一个线程）
+**执行者**：tid 0（通常由第一个线程承担）
 
 ```c
 // 设置 srcs[0]：指向 userInput 的 Chunk 3
@@ -384,17 +383,17 @@ GPU 1 视角 (通过 P2P):
 在 Worker 线程开始工作前，需要一个 barrier 确保所有指针都设置好了。
 
 ```c
-// 所有 Worker 线程（线程 2-253）在这里等待
+// 所有 Worker 线程（tid < nworkers）在这里等待
 subBarrier();
 ```
 
-**为什么叫 subBarrier？** 因为只同步 Worker 线程（254 个），不包括 Post 线程（线程 254-255）。
+**为什么叫 subBarrier？** 因为只同步 Worker 线程（224 个），不包括服务 warp 的线程（tid ≥ nworkers）。
 
 **作用**：确保线程 0 和 1 已经完成了指针设置，Worker 线程可以安全读取 `srcs` 和 `dsts`。
 
 ### 并行数据拷贝和 Reduce
 
-**执行者**：所有 Worker 线程（线程 2-253，共 254 个线程）
+**执行者**：所有 Worker 线程（tid < nworkers，共 224 个线程）
 
 **任务**：
 1. 从两个源读取数据（本地 + 接收的）
@@ -428,17 +427,17 @@ for (int i = tid; i < workSize; i += nworkers) {
 
 **并行度分析**：
 
-假设 `tid = 50`（某个 Worker 线程），`nworkers = 254`：
+假设 `tid = 50`（某个 Worker 线程），`nworkers = 224`：
 
 ```
 tid=50 处理的元素：
-i = 50, 50+254, 50+508, 50+762, ...
+i = 50, 50+224, 50+448, 50+672, ...
 直到 i >= 128K
 
-总共处理约 128K / 254 ≈ 504 个元素
+总共处理约 128K / 224 ≈ 571 个元素
 ```
 
-所有 254 个 Worker 线程并行工作，每个线程处理约 500 个元素。
+所有 224 个 Worker 线程并行工作，每个线程处理约 500-600 个元素。
 
 **数据流动示意**：
 
@@ -446,7 +445,7 @@ i = 50, 50+254, 50+508, 50+762, ...
 GPU 0 userInput[384K-512K]  ───┐
                                │
                                ├──> Reduce (Sum) ──> GPU 1 ring buffer slot 0
-                               │      (254 个线程)       (通过 P2P 写入)
+                               │      (224 个线程)       (通过 P2P 写入)
 GPU 0 ring buffer slot 0    ───┘
 (GPU 3 写入的数据)
 ```
@@ -501,15 +500,15 @@ GPU 1 ring buffer (远端):
 barrier();
 ```
 
-**为什么需要全局 barrier？** 因为 Post 线程（线程 254-255）需要确认所有 Worker 都写完了数据，才能更新计数器通知对方。
+**为什么需要全局 barrier？** 因为服务 warp 的 Post 线程（tid 254/255）需要确认所有 Worker 都写完了数据，才能更新计数器通知对方。
 
 **如果没有这个 barrier 会怎样？**
 
 ```
 错误场景：
-时刻 t1: 线程 254 (RolePostSend) 更新 GPU 0 的 tail = 1
+时刻 t1: tid 254 (RolePostSend) 更新 GPU 0 的 tail = 1
 时刻 t2: GPU 1 看到 tail 更新，开始读 ring buffer slot 0
-时刻 t3: 但线程 253 (Worker) 还没写完数据！
+时刻 t3: 但某个 worker 线程还没写完数据！
 结果: GPU 1 读到部分旧数据或垃圾值
 ```
 
@@ -528,7 +527,7 @@ barrier();
 
 ### 接收方的 postPeer
 
-**执行者**：线程 255（RolePostRecv）
+**执行者**：tid 255（RolePostRecv）
 
 **任务**：更新 head，告诉 GPU 3 可以重用 slot 0
 
@@ -571,7 +570,7 @@ while (connStepCache + 8 < step + 1) {
 
 ### 发送方的 postPeer
 
-**执行者**：线程 254（RolePostSend）
+**执行者**：tid 254（RolePostSend）
 
 **任务**：更新 tail，告诉 GPU 1 可以读 slot 0
 
@@ -593,8 +592,8 @@ st_relaxed_sys_global(conn->tail, step);
 
 ```
 GPU 内存模型允许重排序：
-时刻 t1: 线程 254 更新 tail = 1 (可能先执行)
-时刻 t2: 线程 100 写 dsts[1][1000] = result (还在执行)
+时刻 t1: tid 254 更新 tail = 1 (可能先执行)
+时刻 t2: 某个 worker 线程写 dsts[1][1000] = result (还在执行)
 时刻 t3: GPU 1 看到 tail = 1，开始读 dsts[1][1000]
 时刻 t4: 读到旧数据或垃圾值！
 ```
@@ -677,19 +676,19 @@ GPU 1 ring buffer:
 ```
 时间 →
 
-RoleWaitRecv (线程 0):
+RoleWaitRecv (tid 0):
     ┃━━轮询 tail━━━━┃
     ┃ 0 < 1? 是     ┃
     ┃ ...等待...    ┃
     ┃ tail=1, 满足  ┃
     ┗━━设置 srcs[1]━┛
 
-RoleWaitSend (线程 1):
+RoleWaitSend (tid 1):
     ┃━━轮询 head━━━━┃
     ┃ 0+8 < 1? 否   ┃
     ┗━━设置 dsts[1]━┛
 
-All Workers (线程 2-253):
+All Workers (tid < nworkers):
                     ┃━━ subBarrier ━━┃
                                     ┃
                     ┃━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┃
@@ -700,10 +699,10 @@ All Workers (线程 2-253):
                                                         ┃
                     ┃━━━━━━━ barrier ━━━━━━━━━━━━━━━━━━┃
 
-RolePostRecv (线程 255):
+RolePostRecv (tid 255):
                                                         ┃━━更新 head━━┃
 
-RolePostSend (线程 254):
+RolePostSend (tid 254):
                                                         ┃━━fence━━┃
                                                         ┃更新 tail┃
 
@@ -923,9 +922,9 @@ struct ncclConnInfo {
 - 接收方直接更新 GPU 3 的 head = 1
 
 **线程角色分工**：
-- **RoleWaitRecv/RoleWaitSend**（2 个线程）：轮询，设置指针
-- **Worker**（254 个线程）：数据拷贝和 reduce
-- **RolePostRecv/RolePostSend**（2 个线程）：更新计数器
+- **RoleWaitRecv/RoleWaitSend**（2 个线程）：轮询，设置指针（同时加入 worker warp）
+- **Worker**（224 个线程）：数据拷贝和 reduce
+- **RolePostRecv/RolePostSend**（2 个线程）：更新计数器（驻留在服务 warp）
 
 ### 完整流程（第五章）
 
@@ -938,7 +937,7 @@ struct ncclConnInfo {
 
 **阶段 2：数据传输**
 - subBarrier：Worker 线程同步
-- reduceCopy：254 个 Worker 线程并行处理数据
+- reduceCopy：224 个 Worker 线程并行处理数据
   - 从 srcs[0]（userInput）和 srcs[1]（ring buffer）读取
   - Reduce（Sum）
   - 写到 dsts[1]（GPU 1 的 ring buffer，通过 P2P）
@@ -972,7 +971,7 @@ struct ncclConnInfo {
 **3. 流水线并行**
 - 环形缓冲区 → 收发并行工作（第三章）
 - 线程分工 → Wait/Copy/Post 可并行（第四章）
-- Worker 并行度 → 254 个线程同时处理数据（第五章）
+- Worker 并行度 → 224 个线程同时处理数据（第五章）
 
 **4. 避免争用**
 - 单向连接 → 每个方向独立（第二章）
