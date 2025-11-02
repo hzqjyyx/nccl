@@ -1,90 +1,6 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## About NCCL
 
 NCCL (pronounced "Nickel") is NVIDIA's library providing optimized primitives for inter-GPU communication. It implements collective operations (all-reduce, all-gather, reduce, broadcast, reduce-scatter) and point-to-point communication patterns, optimized for PCIe, NVLink, NVswitch, InfiniBand Verbs, and TCP/IP sockets.
-
-Version: 2.28.7-1 (see `makefiles/version.mk`)
-
-## Build System
-
-NCCL uses both Makefile and CMake build systems:
-
-### Make-based Build (Primary)
-
-```bash
-# Build NCCL library
-make -j src.build
-
-# Build with custom CUDA path
-make src.build CUDA_HOME=/path/to/cuda
-
-# Build for specific architectures (faster compilation, smaller binary)
-make -j src.build NVCC_GENCODE="-gencode=arch=compute_70,code=sm_70"
-
-# Build examples
-make -j examples
-
-# Build examples with MPI support
-make -j examples MPI=1
-
-# Build with custom NCCL installation
-cd examples && make NCCL_HOME=/path/to/nccl
-```
-
-Build output goes to `build/` directory (configurable via `BUILDDIR`).
-
-### CMake-based Build
-
-```bash
-# Configure with default options
-cmake -S . -B build
-
-# Build
-cmake --build build -j
-
-# Common options
-cmake -S . -B build \
-  -DCUDA_HOME=/path/to/cuda \
-  -DCMAKE_CUDA_ARCHITECTURES="70;80;90" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DVERBOSE=ON \
-  -DDEBUG=ON \
-  -DASAN=ON \
-  -DTRACE=ON \
-  -DWERROR=ON \
-  -DPROFAPI=ON \
-  -DNVTX=ON
-```
-
-### Package Building
-
-```bash
-# Debian/Ubuntu package
-make pkg.debian.build
-ls build/pkg/deb/
-
-# RedHat/CentOS package
-make pkg.redhat.build
-ls build/pkg/rpm/
-
-# OS-agnostic tarball
-make pkg.txz.build
-ls build/pkg/txz/
-```
-
-### Testing
-
-NCCL tests are maintained separately at https://github.com/nvidia/nccl-tests:
-
-```bash
-git clone https://github.com/NVIDIA/nccl-tests.git
-cd nccl-tests
-make
-./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
-```
 
 ## Architecture Overview
 
@@ -158,38 +74,6 @@ make
   - `plugin/`: Plugin interfaces (net, tuner, profiler)
   - `nccl_device/`: Device-side API headers
 
-## Examples Directory
-
-Progressive learning path from basic to advanced (see `examples/README.md`):
-
-**Basic Examples** (self-contained, single-file):
-1. `01_communicators/`: Creating/destroying communicators (single/multi-thread/MPI)
-2. `02_point_to_point/`: Send/recv operations in ring pattern
-3. `03_collectives/`: Basic collective communication
-
-**Advanced Features**:
-4. `04_user_buffer_registration/`: User Buffer Registration API
-5. `05_symmetric_memory/`: Symmetric memory/window registration (since 2.27)
-6. `06_device_api/`: Device-side kernel API for fused compute+communication
-
-**Common Directory**: `examples/common/` contains shared bootstrap/broadcast code for advanced examples.
-
-### Running Examples
-
-```bash
-# Threaded mode (default)
-NTHREADS=4 ./example_name
-
-# MPI mode (if built with MPI=1)
-mpirun -np 4 ./example_name
-
-# Control visible GPUs
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./example_name
-
-# Enable debugging
-NCCL_DEBUG=INFO ./example_name
-```
-
 ## Development Patterns
 
 ### API Visibility
@@ -220,26 +104,6 @@ NCCL supports multiple pointer types:
 - `NCCL_PTR_HOST`: System memory
 - `NCCL_PTR_CUDA`: GPU memory
 - `NCCL_PTR_DMABUF`: DMA-BUF support (plugin-dependent)
-
-## Important Build Variables
-
-### Makefile Variables
-- `BUILDDIR`: Build output directory (default: `./build`)
-- `CUDA_HOME`: CUDA installation path (default: `/usr/local/cuda`)
-- `NVCC_GENCODE`: Target GPU architectures
-- `MPI`: Enable MPI support in examples (`0` or `1`)
-- `MPI_HOME`: MPI installation path
-- `NCCL_HOME`: NCCL installation path for examples
-
-### CMake Options
-- `CMAKE_CUDA_ARCHITECTURES`: Target GPU architectures
-- `CMAKE_BUILD_TYPE`: `Release` or `Debug`
-- `DEBUG`, `ASAN`, `UBSAN`: Debugging/sanitizer flags
-- `TRACE`: Enable tracing
-- `PROFAPI`: Enable profiling API (default: ON)
-- `NVTX`: Enable NVTX markers (default: ON)
-- `RDMA_CORE`, `MLX5DV`: InfiniBand features (Linux only)
-- `NET_PROFILER`: Enable network profiler
 
 ## Key Environment Variables
 
@@ -284,29 +148,99 @@ See [NCCL documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/do
 4. Build as `libnccl-tuner-<name>.so`
 5. Set `NCCL_TUNER_PLUGIN=<name>` or absolute path
 
-## Common Commands
+---
 
-```bash
-# Quick build and test
-make -j src.build && make -j examples
+同时，作为文档作者，你需要遵循以下深度和要求来写作文档。
 
-# Clean build
-make clean
 
-# Build specific example
-cd examples/03_collectives/01_allreduce && make
+## 讲解深度和要求
 
-# Format check (if available)
-make format
+### 核心优先级
 
-# View version
-cat makefiles/version.mk
-```
+1. **正确性（最高优先级）**
+   - 所有概念和逻辑必须依托代码层的验证和确认
+   - 阅读源代码并理解实际实现，不能臆测或推断
+   - 有疑问的地方查阅代码、注释或测试用例来确认
+   - 宁可保守陈述，也不要编造或猜测
 
-## Documentation Links
+2. **易读性（重要）**
+   - **循序渐进**：从简单到复杂，先建立基础概念再深入细节
+   - **前后呼应**：概念首次出现时解释清楚，后续引用时简要提及
+   - **避免大块重复**：相似内容通过引用或简要回顾，不要完整重复讲解
+   - **为有计算机背景的读者优化**：假设读者懂基本的并行计算、内存管理概念
 
-- [NCCL User Guide](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html)
-- [NCCL Developer Guide](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/index.html)
-- [NCCL Tests Repository](https://github.com/NVIDIA/nccl-tests)
-- [Environment Variables](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html)
-- [Troubleshooting](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html)
+### 基本原则
+
+- **口语化但精炼**：像给朋友讲解一样自然，但要结构清晰，不能出现相似内容的重复
+- **"为什么"优先**：不仅说"是什么"，更要深入解释"为什么这样设计"
+- **避免列表式陈述**：要有因果逻辑和过渡语句（如"让我们看看..."、"你可能会问..."、"现在的问题是..."）
+- **只需要考虑一个进程对应一个 GPU 的情况，只需要考虑 Ring 算法**
+- **大纲和文档**：大纲要简单明了，直抵核心问题，文档要循序渐进，清晰易懂。如果写文档的时候发现大纲有遗漏，要补充进去。
+
+### 内容要求
+
+1. **数据结构内存布局**
+   - 描述字段间的关系和依赖
+   - 用到图的地方使用 ```<ImageDescription>...</ImageDescription>``` 标签，内容为图的描述，我会找人根据描述画图
+   - 说明为什么这样布局（cache line 对齐、访问模式等）
+
+2. **生命周期追踪**
+   - 初始化时：如何分配和初始化这些字段
+   - 运行时：如何被使用（结合具体代码路径，如 ncclAllReduce）
+   - 销毁时：如何清理
+
+3. **设计决策的权衡**
+   - 为什么选择这种设计而不是其他方案
+   - 性能、内存、复杂度之间的权衡
+   - 适当引入"反直觉"的案例，挑战常规思维
+
+4. **不要编造数字**
+   - 只使用代码中出现的常量、注释，严禁自己编造性能数据（如 xx ms，xx us 等）
+   - 不要出现"实战环节"或"性能测试"章节
+
+### 深度控制
+
+- **深入的边界**：
+  - ✅ 深入到足以理解"NCCL 为什么这样设计"
+  - ✅ 深入到硬件层面（PCIe、RMDA 物理特性等，但是可以忽略 NVLink，因为其闭源特性，不适合学习）
+  - ❌ 深入到 CUDA runtime 实现细节（除非直接相关）
+
+- **判断标准**：
+  - 如果某个细节不影响理解 NCCL 的设计决策，就点到为止并给出参考链接
+  - 如果某个细节是 NCCL 性能优化的关键，就深入讲解
+
+- **示例**：
+  - ✅ 详细讲解 LL 协议为什么用 flag 而不是轮询计数器（这是 NCCL 的核心设计）
+  - ❌ 详细讲解 `__threadfence_system()` 的硬件实现（这个不是直接相关）
+
+### 读者背景假设
+
+- **假设读者已知**：
+  - 基本并行概念（进程、线程、同步）
+  - GPU 基础（kernel、block、thread、shared memory）
+  - 集合通信概念（AllReduce、Broadcast 的语义）
+
+- **假设读者可能不知道**（需要简要解释或给链接）：
+  - NCCL 特有的概念（channel、ring、chunk、slice）
+  - 内存一致性模型的细节
+  - CUDA 的 warp 级原语
+
+### 格式规范
+
+- **代码位置引用**：使用 GitHub 链接格式
+  - 示例：`[collectives.cc:109-117](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/collectives.cc#L109-L117)`
+
+- **代码示例**：
+  - ✅ 贴关键算法逻辑、数据结构定义（摘取关键字段）
+  - ❌ 贴完整函数（太长时用伪代码代替，但是函数参数等要准确）
+  - 单个代码块不超过 20 行，超过时用 `...` 省略并注释说明
+  - 用行内注释标注关键点，用代码后的文字解释"为什么这样写"
+
+- **概念引用**：
+  - **首次出现**：完整解释并用粗体标记（如 **flag line**）
+  - **同章节引用**：直接使用术语
+  - **跨章节引用**：简要回顾（如"第2章提到的 flag line 用于..."）并附章节链接
+
+- **关键洞察**：每个章节用"**关键洞察：...**"总结核心要点
+
+- **章节结构**：循序渐进，从基础到高级，每章开头简要说明"这章要解决什么问题"

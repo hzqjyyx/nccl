@@ -1,10 +1,10 @@
 # 04 机制协奏实例
 
-前面三章我们已经分别理解了 LL128 的动机、内存布局、以及 Flag Thread 机制。但是这些概念就像是乐器独奏——我们知道小提琴能拉出什么音，也知道大提琴能奏出什么低音，但要理解一首交响乐，还得看它们如何在同一段旋律里配合。
+前面三章分别讲解了 LL128 的动机、内存布局和 Flag Thread 机制。本章将通过一轮 Ring AllReduce 的 Reduce-Scatter 操作展示这些机制如何协同工作。
 
-本章将用一轮 Ring AllReduce 的 Reduce-Scatter 操作串起所有知识点。我们不会逐行 trace 代码，而是聚焦在：**Step 流控、Flag Thread、两阶段寄存器加载这三个机制如何在一个循环里各司其职，又彼此依赖**。同时为关键点附上精确源码位置，方便对照核验。
+我们不会逐行 trace 代码，而是聚焦在：**Step 流控、Flag Thread、两阶段寄存器加载这三个机制如何在一个循环里各司其职，又彼此依赖**。同时为关键点附上精确源码位置，方便对照核验。
 
-读完这章后，你应该能在脑海中播放一段"执行电影"：从 `waitSend()` 检查空间，到 warp 加载数据，再到 Flag Thread 轮询对端，最后写回并更新 Step——整个过程如同流水线上的齿轮，环环相扣。
+读完这章后，你应该能理解完整的执行流程：从 `waitSend()` 检查空间，到 warp 加载数据，再到 Flag Thread 轮询对端，最后写回并更新 Step——整个过程如同流水线上的齿轮，环环相扣。
 
 ---
 
@@ -12,19 +12,13 @@
 
 在正式进入流程之前,先明确几个关键问题：
 
-1. **wait → load → recv → reduce → send → post 这条链路是如何衔接的？**
-   每个环节要等前一个环节做什么？为什么不能并行？
+1. **Step 流控、Flag Thread、两阶段加载如何在一轮循环中衔接？**
+   wait → load → recv → reduce → send → post 这条链路中，每个机制负责什么？它们如何配合避免数据竞争和等待停顿？
 
-2. **Flag Thread 在这条链路中扮演什么角色？**
-   它什么时候检查 flag？什么时候写 flag？其他线程在做什么？
-
-3. **两阶段加载为什么能"隐藏等待"？**
-   `loadRegsBegin` 和 `loadRegsFinish` 之间插入了什么操作？
-
-4. **Step 何时递增？为什么是 per-connection 更新？**
+2. **Step 何时递增？为什么是 per-connection 更新？**
    `sendStep[i] += 1` 和 `recvStep[i] += 1` 的时机有什么讲究？
 
-5. **多 warp 如何协同？**
+3. **多 warp 如何协同？**
    8 个 warp 同时写入，如何避免冲突？
 
 这些问题的答案都藏在 `GenericOp()` 和 `recvReduceSendCopy()` 这两个函数的编排里。让我们从一个具体场景出发（源码位置：`src/device/prims_ll128.h` 中 `GenericOp` 主循环与 `recvReduceSendCopy`）。
@@ -66,7 +60,7 @@ GPU 0 ←→ GPU 1 ←→ GPU 2 ←→ GPU 3
 
 - **环形缓冲区**：分成 8 个 slot，每个 slot 对应一个 Step。
 - **128B 行**：每个 slot 包含若干条 128B 行，每条行 = 15 个数据 uint64_t + 1 个 flag uint64_t。
-- **Warp 粒度**：一个 warp 每轮处理 16 条行（1920B 数据 + 128B flag）。
+- **Warp 粒度**：一个 warp（32 个 CUDA 线程的执行单元，同步执行）每轮处理 16 条行（1920B 数据 + 128B flag）。
 
 现在问题来了：GPU 1 如何知道 GPU 0 已经把数据写好了？GPU 2 又如何避免被 GPU 1 覆盖？答案就在 `GenericOp` 的循环里。
 
@@ -103,7 +97,7 @@ barrier();
 
 **第一步：检查发送空间**（`waitSend` 源码：[`src/device/prims_ll128.h:58-69`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L58-L69)）
 
-在开始任何工作之前，如果需要发送（`SEND=1`），就要调用 `waitSend()` 检查对端是否有足够的空间。这个函数会计算本次操作需要多少字节，然后检查 `sendConnHead` 是否领先 `sendConnHeadCache` 超过 8 个 Step。如果超过了，说明对端还没消费完，发送方必须 spin 等待。
+在开始任何工作之前，如果需要发送（`SEND=1`），就要调用 `waitSend()` 检查对端是否有足够的空间。这个函数会计算本次操作需要多少字节，然后检查：如果即将写入的 step（`sendConnHead + 1`）超过对端已消费的 step（`sendConnHeadCache`）加上 `NCCL_STEPS` 个位置，说明对端还没消费完，发送方必须 spin 等待。
 
 这就是 **Step 流控的节拍器**：它保证发送方永远不会绕圈覆盖对端正在读取的数据。
 
@@ -347,26 +341,12 @@ store128 (写回环形缓冲区，Flag Thread 写 flag)
 
 这三个技巧配合起来，让 LL128 在"单 flag"的约束下依然能保持高带宽。
 
----
+### 4.5 节点间通信的补充验证
 
-## 5. 节点内 vs 节点间：写入可见性与验证路径
+以上讲解的设备端执行逻辑适用于节点内（GPU↔GPU P2P）通信。节点间通信时，Flag Thread 的轮询机制依然有效，但有额外的保证机制：
 
-这一节专门讲清楚“节点内（NVLink/PCIe P2P）”与“节点间（RDMA/Socket，经 Proxy）”的差异：谁来保证写入可见性、谁来校验 flag、何时可以认为“这一 step 真正就绪”。
-
-1) 节点内（GPU↔GPU P2P）
-- 写入路径：GPU 设备侧线程通过 `store128` 写 peer 的 LL128 缓冲区，Flag Thread 将 `flag = sendStep+1` 盖到每条 128B 行尾；所有 warp 在 `barrier()` 后统一 `sendStep++/postSend()`（源码：[`src/device/prims_ll128.h:319-323`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L319-L323)）。
-- 可见性保证：`postSend()` 中在 sm_90 及以上使用 `__threadfence_system()`，否则使用 `__threadfence()`（源码：[`src/device/prims_ll128.h:68-73`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L68-L73)）。这保证“数据+flag 的写入”先于 `tail` 的更新被对端看见。P2P 读方依靠设备侧轮询 `flag` 的循环（[`src/device/prims_ll128.h:181-201`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L181-L201)）实现“读到的都是已盖章的完整行”。
-- 验证主体：完全在 GPU 端，由 Flag Thread 轮询行尾 flag + `__any_sync` 保证 warp 一致重读。
-
-2) 节点间（经网络，Proxy 参与）
-- 写入与通知：设备侧逻辑同上，仍旧通过 `store128` + `postSend()` 完成“写后通知”。但当 LL128 缓冲区位于系统内存（非 GDR）时，设备端的 `__threadfence()` 仅保证对设备可见，不必然对 CPU 完全可见。
-- Proxy 的补充校验：在 `sendProxyProgress` 中，当协议为 LL128 且 `useGdr==0` 时，Proxy 会逐行检查 flag 是否等于 `step+1`，只有全部匹配才执行 `isend`（源码：[`src/transport/net.cc:1268-1296`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/transport/net.cc#L1268-L1296)）。这一步为“GPU→CPU/网卡”路径补上了强一致性。
-- GDR 场景：当 `useGdr==1` 时，Proxy 认为数据已就绪，无需逐行检查（同上代码路径）；设备侧在 sm_90 使用 `__threadfence_system()` 进一步保证“系统域可见性”，与网卡直连一致。
-- 辅助可见性维护：在 Proxy 更新 `sendHead` 时，会按需使用 `wc_store_fence()` 刷新写合并缓冲（例如 `gdcSync` 路径），确保对端能看到“我已推进 head”的事实（源码片段同函数内部）。
-
-3) 小结：
-- 节点内：一致性验证全部在设备侧完成；`postSend` 的 fence 顺序保证“先数据/flag、后 tail”。
-- 节点间：非 GDR 由 CPU 侧 Proxy 做“逐行 flag 验证”，GDR 则依赖设备侧 fence + NIC/GPU 的一致性保证；两种情况下 `postSend` 的 fence 语义都是“因（数据+flag）在前，果（tail）在后”。
+- **非 GDR 路径**：当 LL128 缓冲区位于系统内存时，Proxy 线程会在 CPU 侧逐行验证 flag 是否等于 `step+1`，只有全部匹配才通过网络发送（源码：[`src/transport/net.cc:1268-1296`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/transport/net.cc#L1268-L1296)）。这为"GPU→CPU/网卡"路径补上了强一致性保证。
+- **GDR 路径**：网卡直接读取 GPU 内存时，设备端的 `__threadfence_system()` 保证了跨设备可见性，Proxy 无需额外验证。
 
 **关键洞察：两阶段加载不是为了"先 load 再重排"这么简单，而是为了把重排的依赖延迟到等待远端数据之后，让 GPU 能在等待的同时处理本地内存请求。Flag Thread 的轮询也不是"先等再读"，而是"边读边等"，用 warp 级同步把所有线程捆在一起。**
 
@@ -374,25 +354,29 @@ store128 (写回环形缓冲区，Flag Thread 写 flag)
 
 ## 6. 多 warp 协同与地址分配
 
-### 6.1 wireOffset 的推进
+### 6.1 wireOffset 的初始化与推进
 
-在 `GenericOp` 的循环里，每轮结束后 `wireOffset` 会推进（源码：[`src/device/prims_ll128.h:313-316`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L313-L316)）：
+`wireOffset` 控制每个 warp 在环形缓冲区中的写入位置。它的初始化和推进逻辑确保多个 warp 不会冲突（源码：[`src/device/prims_ll128.h:297`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L297) 和 [`313-316`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L313-L316)）。
 
+**初始化**：
+```c++
+int wireOffset = WireWordPerSlice*warp + 2*wid;
+```
+每个 warp 从不同的起始位置开始（`WireWordPerSlice*warp`），加上线程内的偏移（`2*wid`）。这保证了不同 warp 写入不同的 128B 行段。
+
+**推进**：
 ```c++
 wireOffset += WireWordPerSlice*nwarps;
 ```
-
-`WireWordPerSlice = 256`，表示一个 warp 一轮写 256 个 uint64_t（2048B = 16 条 128B 行）。如果有 8 个 warp，`nwarps = 8`，推进量就是 `256 * 8 = 2048` 个 uint64_t，即 16KB。
+每轮循环结束后，`wireOffset` 推进 `WireWordPerSlice*nwarps`。`WireWordPerSlice = 256`，表示一个 warp 一轮写 256 个 uint64_t（2048B = 16 条 128B 行）。如果有 8 个 warp，`nwarps = 8`，推进量就是 `256 * 8 = 2048` 个 uint64_t，即 16KB。
 
 这保证了下一轮循环时，每个 warp 都写在上一轮的后面，不会覆盖彼此的数据。
 
 ### 6.2 Flag Thread 的分布
 
-每个 warp 内有 4 个 Flag Thread（`tid % 8 == 7` 的线程，lanes 7/15/23/31），负责 4 条行的 flag。8 个 warp 共有 32 个 Flag Thread，负责 `8 * 16 = 128` 条行中的 32 条（Flag Thread 写入逻辑见发送环节 [`src/device/prims_ll128.h:260-286`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L260-L286)）。
+每个 warp 内有 4 个 Flag Thread（`tid % 8 == 7` 的线程，lanes 7/15/23/31），负责写入和验证 flag。如果有 8 个 warp，那么总共有 `8 × 4 = 32` 个 Flag Thread（Flag Thread 写入逻辑见发送环节 [`src/device/prims_ll128.h:260-286`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L260-L286)）。
 
-等等，16 条行只需要 16 个 flag，为什么有 32 个 Flag Thread？
-
-答案是：**每个 Flag Thread 在 `recvReduceSendCopy()` 的循环里写 4 次 flag**（`for (int u=0; u<ELEMS_PER_THREAD; u+=2)` 共迭代 4 次），所以每个 Flag Thread 负责 4 条行。一个 warp 的 4 个 Flag Thread 刚好覆盖 16 条行。
+但每个 warp 只负责自己的 16 条 128B 行。这 16 条行需要 16 个 flag，恰好由一个 warp 的 4 个 Flag Thread 覆盖。原因是：**每个 Flag Thread 在 `recvReduceSendCopy()` 的循环里写 4 次 flag**（`for (int u=0; u<ELEMS_PER_THREAD; u+=2)` 共迭代 4 次，`ELEMS_PER_THREAD = 8`），所以每个 Flag Thread 负责 4 条行，4 个 Flag Thread 共覆盖 16 条行。
 
 ### 6.3 多 warp 的 barrier
 
@@ -414,7 +398,7 @@ barrier();  // 结束后
 - 某个 warp 还在 `waitSend()` spin，其他 warp 已经开始写入 → 数据不一致。
 - 某个 warp 已经写完并更新了 `sendStep`，其他 warp 还在写 → 对端可能读到半成品。
 
-### 5.4 Step 边界的对齐
+### 6.4 Step 边界的对齐
 
 每个 Step 包含 `stepSize` 字节，能容纳若干轮循环。当所有 warp 完成所有循环后，才会在 `GenericOp` 的结尾递增 `sendStep` 并调用 `postSend()`。
 
@@ -430,47 +414,46 @@ barrier();  // 结束后
 
 ## 7. 完整的执行时序图
 
-现在我们可以画出一轮 `GenericOp` 的完整时序：
+现在我们可以画出一轮 `GenericOp` 的完整执行流程。注意有些步骤可以并行，箭头表示依赖关系：
 
 ```
-时刻 T0: waitSend() 检查空间
-         ↓ (如果空间不足，spin 等待)
-时刻 T1: barrier() 所有线程同步
-         ↓
-时刻 T2: loadRegsBegin() 发出本地内存读请求
-         ↓
-时刻 T3: 进入 recvReduceSendCopy()
-         ├─ 所有线程 load 远端数据
-         ├─ Flag Thread 检查 flag
-         ├─ warp 级同步：任一 flag 不匹配就重新 load
-         └─ (等待期间，T2 的内存请求在后台处理)
-         ↓
-时刻 T4: loadRegsFinish() 重排寄存器
-         ↓
-时刻 T5: applyReduce() 规约
-         ↓
-时刻 T6: store128() 写回环形缓冲区
-         ├─ 所有线程写数据
-         └─ Flag Thread 写 flag
-         ↓
-时刻 T7: 推进 wireOffset，处理下一个 slice
-         ↓ (重复 T2-T7 直到所有数据处理完)
-时刻 T8: barrier() 所有线程同步
-         ↓
-时刻 T9: 更新 sendStep[i] += 1
-         ↓
-时刻 T10: postSend() 执行 fence 并更新 tail
-         ↓
-时刻 T11: 更新 recvStep[i] += 1
-         ↓
-时刻 T12: postRecv() 更新 head
+步骤 S0: waitSend() 检查空间
+  ↓ (如果空间不足，spin 等待)
+步骤 S1: barrier() 所有线程同步
+  ↓
+步骤 S2: loadRegsBegin() 发出本地内存读请求  ← (后台并行处理)
+  ↓
+步骤 S3: 进入 recvReduceSendCopy()
+  ├─ 所有线程 load 远端数据
+  ├─ Flag Thread 检查 flag
+  ├─ warp 级同步：任一 flag 不匹配就重新 load  ← (等待期间 S2 的请求在后台完成)
+  ↓
+步骤 S4: loadRegsFinish() 重排寄存器  ← (此时 S2 大概率已完成)
+  ↓
+步骤 S5: applyReduce() 规约
+  ↓
+步骤 S6: store128() 写回环形缓冲区
+  ├─ 所有线程写数据
+  └─ Flag Thread 写 flag
+  ↓
+步骤 S7: 推进 wireOffset，处理下一个 slice
+  ↓ (重复 S2-S7 直到所有数据处理完)
+步骤 S8: barrier() 所有线程同步
+  ↓
+步骤 S9: 更新 sendStep[i] += 1
+  ↓
+步骤 S10: postSend() 执行 fence 并更新 tail
+  ↓
+步骤 S11: 更新 recvStep[i] += 1
+  ↓
+步骤 S12: postRecv() 更新 head
 ```
 
-这个时序图展示了三个机制的协奏：
+这个执行流程展示了三个机制的协奏：
 
-1. **Step 流控**：T0 检查空间，T10-T12 通知对端，形成"节拍"。
-2. **Flag Thread**：T3 轮询 flag，T6 写入 flag，形成"门卫"和"盖章"。
-3. **两阶段加载**：T2 发出请求，T4 重排寄存器，中间插入 T3 的等待，形成"隐藏延迟"。
+1. **Step 流控**：S0 检查空间，S10-S12 通知对端，形成"节拍"。
+2. **Flag Thread**：S3 轮询 flag，S6 写入 flag，形成"门卫"和"盖章"。
+3. **两阶段加载**：S2 发出请求，S4 重排寄存器，中间插入 S3 的等待，形成"隐藏延迟"。
 
 ---
 
@@ -478,37 +461,27 @@ barrier();  // 结束后
 
 现在我们可以回答开头提出的问题了：
 
-### Q1: wait → load → recv → reduce → send → post 如何衔接？（源码：主循环 [`src/device/prims_ll128.h:291-317`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L291-L317)，后置更新 [`src/device/prims_ll128.h:319-323`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L319-L323)）
+### Q1: Step 流控、Flag Thread、两阶段加载如何在一轮循环中衔接？
 
-- **wait**：`waitSend()` 检查对端空间，spin 直到可以写入。
-- **load**：`loadRegsBegin()` 发出本地内存读请求。
-- **recv**：`recvReduceSendCopy()` 中，所有线程 load 远端数据，Flag Thread 检查 flag。
-- **reduce**：`applyReduce()` 规约远端与本地数据。
-- **send**：`store128()` 写回环形缓冲区，Flag Thread 写 flag。
-- **post**：`postSend()` 执行 fence 并更新 tail，通知对端；`postRecv()` 更新 head，通知对端。
+在 `GenericOp` 的一轮循环中（源码：主循环 [`src/device/prims_ll128.h:291-317`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L291-L317)，后置更新 [`src/device/prims_ll128.h:319-323`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L319-L323)）：
 
-每个环节都依赖前一个环节的结果，但通过"并行发出请求 + 延迟处理依赖"的方式，隐藏了大部分等待时间。
+- **Step 流控**：循环开始前，`waitSend()` 检查对端空间，确保不会绕圈覆盖；循环结束后，`postSend()` / `postRecv()` 更新 step 计数器并通知对端。
+- **Flag Thread**：在 `recvReduceSendCopy()` 中，接收时轮询 flag 确保远端数据有效，发送时写入 flag 标记数据完整。其他线程专注于数据搬运和规约。
+- **两阶段加载**：`loadRegsBegin()` 发出本地内存读请求后不阻塞，在等待远端数据（Flag Thread 轮询 flag）时，GPU 后台处理内存请求，到 `loadRegsFinish()` 时数据已准备好，隐藏了等待时间。
 
-### Q2: Flag Thread 扮演什么角色？（源码：校验环 [`src/device/prims_ll128.h:181-201`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L181-L201)，写 flag [`src/device/prims_ll128.h:260-286`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L260-L286)）
+三者配合实现"并行发出请求 + 延迟处理依赖"，避免了大部分等待停顿。
 
-- **接收时**：轮询 flag，作为 warp 的"门卫"，确保远端数据有效。
-- **发送时**：写入 flag，作为 warp 的"盖章员"，标记数据已完整。
-- **其他线程**：专注于数据搬运和规约，不关心 flag。
+### Q2: Step 何时递增？为什么 per-connection？
 
-### Q3: 两阶段加载为什么能"隐藏等待"？（源码：`loadRegsBegin` 与 `loadRegsFinish`，[`src/device/prims_ll128.h:86-142`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L86-L142)）
+**递增时机**（源码：[`src/device/prims_ll128.h:319-323`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L319-L323)）：在 `GenericOp` 的结尾，所有数据处理完、所有 warp 完成 barrier 后。
 
-- `loadRegsBegin()` 发出内存读请求后，GPU 不会阻塞，而是继续执行后续指令。
-- 等待远端数据时（轮询 flag），GPU 在后台处理 `loadRegsBegin()` 的内存请求。
-- `loadRegsFinish()` 被延迟到等待结束后，此时内存请求大概率已完成，重排几乎不需要等待。
+**per-connection**：每个 connection 有独立的 Step 计数器，因为不同 peer 的进度可能不同。Ring 拓扑下通常只有一个 peer，所以循环体内只执行一次。
 
-### Q4: Step 何时递增？为什么 per-connection？（源码：[`src/device/prims_ll128.h:319-323`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L319-L323)）
+### Q3: 多 warp 如何协同？
 
-- **递增时机**：在 `GenericOp` 的结尾，所有数据处理完、所有 warp 完成 barrier 后。
-- **per-connection**：每个 connection 有独立的 Step 计数器，因为不同 peer 的进度可能不同。Ring 拓扑下通常只有一个 peer，所以循环体内只执行一次。
+（源码：`wireOffset` 初始化/推进 [`src/device/prims_ll128.h:297-316`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L297-L316)；barrier/step 更新 [`src/device/prims_ll128.h:319-323`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L319-L323)）
 
-### Q5: 多 warp 如何协同？（源码：`wireOffset` 初始化/推进 [`src/device/prims_ll128.h:297-316`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L297-L316)；barrier/step 更新 [`src/device/prims_ll128.h:319-323`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L319-L323)）
-
-- **地址分配**：`wireOffset` 的推进保证每个 warp 写在不同位置。
+- **地址分配**：`wireOffset` 的初始化和推进保证每个 warp 写在不同位置。
 - **时序同步**：`barrier()` 保证所有 warp 在同一时刻开始/结束。
 - **Step 对齐**：所有 warp 共同完成一个 Step 后，才更新 Step 计数器。
 
@@ -516,21 +489,15 @@ barrier();  // 结束后
 
 
 
-## 9. 总结：三组乐手的协奏
+## 9. 总结
 
-回到本章开头的比喻：LL128 的执行循环像是三组乐手同时演奏。
+LL128 通过三个机制的配合实现了在单 flag 约束下的高带宽：
 
-- **Step 流控是指挥**：它挥动指挥棒（`waitSend` / `postSend` / `postRecv`），控制整个乐团的节奏。发送方不能冲得太快，接收方不能落得太后。
-- **Flag Thread 是首席**：它坐在乐团的关键位置（每 8 个线程里有 1 个），在关键时刻领奏（轮询 flag / 写入 flag）。其他乐手跟着首席的节奏走。
-- **两阶段加载是助理**：它在后台准备乐谱（发出内存请求），等首席需要时（`loadRegsFinish`），乐谱已经准备好，不需要等待。
+- **Step 流控**：通过 `waitSend` / `postSend` / `postRecv` 控制整个 Ring 的节奏，保证发送方不会绕圈覆盖对端正在读取的数据。
+- **Flag Thread**：在每个 warp 的关键位置（每 8 个线程里有 1 个）轮询和写入 flag，保证接收方不会读到半成品数据。
+- **两阶段加载**：通过 `loadRegsBegin` 提前发出内存请求，在等待远端数据时让 GPU 后台处理本地内存加载，到 `loadRegsFinish` 时数据已经准备好，隐藏了内存延迟。
 
-三组乐手各司其职，又彼此配合：
-
-- 指挥保证不会"翻车"（绕圈覆盖）；
-- 首席保证不会"跑调"（读到半成品）；
-- 助理保证不会"停顿"（隐藏内存延迟）。
-
-最终呈现出来的，就是一段流畅的"数据交响乐"：从 `waitSend()` 的前奏，到 `recvReduceSendCopy()` 的高潮，再到 `postSend()` 的尾声，每个音符都恰到好处。
+三者配合形成完整的流水线：从 `waitSend()` 检查空间，到 `recvReduceSendCopy()` 处理数据，再到 `postSend()` 通知对端，每个环节都紧密衔接，不会因为等待而停顿。
 
 **关键洞察：LL128 的高带宽不是靠"跑得快"，而是靠"不停顿"。Step 流控保证不会撞车，Flag Thread 保证不会读脏数据，两阶段加载保证不会等内存。三者配合，让单 flag 的约束下依然能榨干硬件带宽。**
 

@@ -49,37 +49,7 @@ LL128（128B 行，单标志位）定义：[src/include/device.h:105-107](https:
 
 ## 问题背景
 
-这节要解决的问题：LL 为什么采用“双标志 + 16B 行”，而 LL128 如何在“单标志 + 128B 行”下仍保持正确性并提升带宽有效载荷？
-
-先看 LL 的历史设计：
-- LL 的一条“行”是 16 字节，内部交错为“数据+标志”的半行结构，两个 32bit 标志分别跟随两段 32bit 数据，见 [src/include/device.h:70-83](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/device.h#L70-L83)。
-- 这样做的目的，是在较弱的写入原子性假设下，依赖“标志紧随其数据”来避免误读——即使乱序或分段到达，接收方也会等待两个标志都匹配才取走 8 字节有效数据。
-
-而在 LL128 中：
-- 一条行扩展为 128 字节，由 16 个 `uint64_t` 构成，其中前 15 个是数据，最后 1 个是 64bit 的 flag，见 [src/include/device.h:105-107](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/device.h#L105-L107)。
-- 载荷比例从 LL 的 50%（8B 数据/16B 行）提升到 93.75%（120B 数据/128B 行）。
-- 风险也随之而来：如果末尾 flag 先被观察到，而行内某些数据仍是旧值，就会产生“半成品”可见的错误。
-
-因此，LL128 必须满足两条约束：
-1) 顺序性/可见性：flag 必须在“行内所有数据”之后写入并对外可见；
-2) 成对可见：不出现“半写入”的中间态（16B 写作为一对可见）。
-
-这两条在节点内/跨节点的路径不同，但“谁来写/验这个 flag、如何与数据线程配合”的核心由 Flag Thread 承担。关于跨节点 fence 的位置，可先看 postSend 概览：[src/device/prims_ll128.h:58-83](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L58-L83)
-
-```c++
-inline __device__ void postSend() {
-  if (sendConnTailPtr) {
-#if __CUDA_ARCH__ >= 900
-    __threadfence_system();                  // Hopper+：系统级 fence，保证对外顺序可见
-#else
-    __threadfence();                         // 更早架构：设备级 fence
-#endif
-    *sendConnTailPtr = sendConnTail += 1;    // 通知对端（经由 head/tail 协议）
-  }
-}
-```
-
-关键洞察：通过把“校验职责”集中到少量专职线程（Flag Thread），再配合向量化 16B 写与正确的等待/轮询，LL128 在不牺牲带宽的前提下重建了“单 flag”的因果保证。
+LL128 用单 flag 替换 LL 的双标志位，将载荷比从 50% 提升到 93.75%（120B 数据/128B 行）。风险在于：如果 flag 先于数据可见，接收方会误读"半成品"行。因此 LL128 必须保证：1) flag 在所有数据之后写入并可见；2) 16B 写对的成对可见（不出现半写入）。Flag Thread 通过专职角色配合向量化 16B 写与 warp 级轮询，在不牺牲带宽的前提下重建单 flag 的因果保证。
 
 ---
 
@@ -128,25 +98,21 @@ for (int u=0; u<ELEMS_PER_THREAD; u+=2) {     // ELEMS_PER_THREAD = 8 → 迭代
 3) 为什么偏偏是余数 7？地址天然落在“行尾前一个 64bit”的位置：[src/device/prims_ll128.h:297](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L297)
 
 ```c++
-int wireOffset = WireWordPerSlice*warp + 2*wid; // 2*wid = 本线程的行内起始偏移（单位：u64）
+int wireOffset = WireWordPerSlice*warp + 2*wid; // wireOffset 是相对于缓冲区起始的全局偏移（单位：u64）
 ```
 
-- 每条 128B 行占 16 个 u64 槽，行尾 flag 在第 15 槽（0 基）。
-- 当 `wid ≡ 7 (mod 8)` 时，`2*wid ≡ 14 (mod 16)`，即“行尾前一个 u64”的索引。
-- `store128` 每次写 2 个 u64（前是数据，后是 flag），因此 Flag Thread 无需额外地址运算即可把 flag 自然落在行尾。
+- 每条 128B 行占 16 个 u64 槽，行尾 flag 在第 15 槽（0 基，即 `NCCL_LL128_DATAELEMS`）。
+- `wireOffset` 是全局偏移，但 `(2*wid) mod 16` 决定了线程在各自行内的槽位。
+- 对于 Flag Thread（wid ∈ {7,15,23,31}）：`2*wid mod 16 = 14`，即在各自行内的第 14 号槽位（倒数第二个 u64）。
+- `store128` 每次写 2 个 u64：从第 14 号槽位开始，写入槽位 14（数据）和槽位 15（flag）。
+- 因此 Flag Thread 无需额外地址运算即可把 flag 自然落在行尾 flag 的位置。
 
 图示：Flag Thread 覆盖 16 条行的分工
 
 <ImageDescription>
-一张两层示意图。
-- 上层：横轴 0~31 标注 warp 的 32 个 lane。用高亮标出 7、15、23、31 四个 lane，并在图例标注“Flag Thread”。
-- 下层：画出 16 条 128B 行，每条行切分为 16 个格（代表 16 个 64bit 槽位），其中前 15 个用浅蓝色表示“数据”，最后 1 个用红色表示“flag 槽”。
-- 用箭头连接：
-  - lane 7 负责 Line 0/4/8/12 的红色“flag 槽”；
-  - lane 15 负责 Line 1/5/9/13 的“flag 槽”；
-  - lane 23 负责 Line 2/6/10/14 的“flag 槽”；
-  - lane 31 负责 Line 3/7/11/15 的“flag 槽”。
-- 附注：每个线程每轮有 4 次迭代（u=0,2,4,6），Flag Thread 每次迭代写 1 个 flag，4 个 Flag Thread × 4 次 = 16 条行。
+上层：warp 的 32 个 lane，高亮 lane 7/15/23/31（Flag Thread）。
+下层：16 条 128B 行，每行 16 个槽位（前 15 蓝色数据，最后 1 红色 flag）。
+箭头：每个 Flag Thread 覆盖 4 条行的 flag 槽（lane 7 → Line 0/4/8/12，依此类推）。
 </ImageDescription>
 
 关键洞察：`(tid%8)==7` 让 4 个 Flag Thread 既能“满覆盖”一轮的 16 条 128B 行尾，又避免额外地址运算与写入竞争；这是“16 槽行结构 + 2×wid 起始步长 + 16B 向量写”共同作用的结果。
@@ -155,13 +121,17 @@ int wireOffset = WireWordPerSlice*warp + 2*wid; // 2*wid = 本线程的行内起
 
 ## 寄存器阶段：两阶段加载与重排（为 flag 腾位）
 
-这节要解决的问题：Flag Thread 如何在“寄存器阶段”就为行尾 flag 腾出空间，同时把等待对端数据的时间塞满、隐藏掉？更具体说：为什么要拆成 Begin/Finish 两个阶段，Begin 到底少装了什么，Finish 又做了什么搬运？
+这节要解决的问题：Flag Thread 如何在"寄存器阶段"就为行尾 flag 腾出空间，同时把等待对端数据的时间塞满、隐藏掉？
 
-先把直觉立住：我们希望所有线程都沿用一条统一的写回路径（后面会看到同一条 `store128` 循环），但 Flag Thread 需要在每个 16B 写对的“第二个 64bit 槽”塞入 flag。要做到这一点，Flag Thread 在寄存器里就要预留出这些“第二槽”。这就是两阶段加载的动机。
+**核心策略**：Flag Thread 预留奇数寄存器槽给 flag，数据装在偶数槽。这样在写回时，所有线程都能走同一条 `store128` 循环——Flag Thread 在第二个 64bit 位置输出 flag，普通线程输出数据。
 
-1) Begin：对齐路径下“只装偶数组”，奇数组留白
+**为什么要两阶段**？关键在于隐藏延迟。Begin 阶段只装一半数据（Flag Thread 只在 `g%2==0` 的迭代中加载），然后在等待对端数据期间，Finish 阶段把这些数据重新排列，让奇数槽空出来专供 flag 使用。这样"寄存器重排"的时间被等待时间完全隐藏。
 
-对齐且直接从 src 加载时，Flag Thread 只在 `g%2==0` 的循环里装寄存器（偶数组），奇数组留白。非 Flag Thread 全装。
+**具体追踪一个 Flag Thread (wid=7)**：假设 `WordPerThread=8`，即寄存器数组 `regs[0..7]` 共 8 个 uint64_t 槽位。
+
+现在看代码如何实现这个策略：
+
+1) Begin：只在 `g%2==0` 的迭代中加载数据
 
 [src/device/prims_ll128.h:86-107](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L86-L107)
 
@@ -170,18 +140,18 @@ template<int WordPerThread>
 __device__ __forceinline__ void loadRegsBegin(uint64_t(&regs)[WordPerThread], T const *src, int eltN) {
   constexpr int EltPer16B = 16/sizeof(T);
   if(reinterpret_cast<uintptr_t>(src)%16 == 0) {
-    /* 对齐良好：Flag 线程装“半量”，把奇数组留空给 flag。*/
+    /* 对齐良好：Flag 线程只在 g%2==0 时加载（跳过 g=1,3...）*/
     #pragma unroll
-    for(int g=0; g < WordPerThread/2; g++) {
+    for(int g=0; g < WordPerThread/2; g++) {              // g=0,1,2,3（WordPerThread=8 时）
       int ix = g*WARP_SIZE - 4*(g/2) + wid - (g%2)*(wid/8);
-      if(!flagThread || g%2==0) {
+      if(!flagThread || g%2==0) {                         // Flag Thread 只执行 g=0,2
         if(ix*EltPer16B < eltN)
           load128((uint64_t*)(src + ix*EltPer16B), regs[2*g+0], regs[2*g+1]);
       }
     }
   } else {
     /* 非 16B 对齐：先把最小包络对齐区搬到 shmem，再从 shmem 读回到 regs，
-       仍然保证“Flag 线程只装偶数组”的布局，这样 Finish 能统一处理。*/
+       仍然保证 Flag 线程只在 g%2==0 时加载，这样 Finish 能统一处理。*/
     int misalignment = reinterpret_cast<uintptr_t>(src) % 16;
     uint64_t *src8 = reinterpret_cast<uint64_t*>(reinterpret_cast<uintptr_t>(src) & -uintptr_t(16));
     uint64_t *shm8 = shmemCvtPtr((uint64_t*)ncclScratchForWarp(warpInBlock));
@@ -206,9 +176,23 @@ __device__ __forceinline__ void loadRegsBegin(uint64_t(&regs)[WordPerThread], T 
 }
 ```
 
-2) Wait→Finish：把等待时间“塞满”，并把数据搬到偶数寄存器
+**对于 Flag Thread (wid=7)，循环行为是**：
+- g=0: `g%2==0` ✓ → 执行 `load128(..., regs[0], regs[1])`，加载数据到 regs[0,1]
+- g=1: `g%2==1` ✗ → **跳过**，regs[2,3] 保持未初始化
+- g=2: `g%2==0` ✓ → 执行 `load128(..., regs[4], regs[5])`，加载数据到 regs[4,5]
+- g=3: `g%2==1` ✗ → **跳过**，regs[6,7] 保持未初始化
 
-在 `recvReduceSendCopy()` 的“等待对端第一批数据”与“预处理”之间，Finish 会把 Flag Thread 的数据从“奇数组”搬到“偶数组”，从而让奇数组持续为空、专供 flag 使用。非 Flag Thread 则无需搬运。
+**Begin 后寄存器状态**：
+```
+regs[0] = 数据A    regs[1] = 数据B
+regs[2] = 留白     regs[3] = 留白
+regs[4] = 数据C    regs[5] = 数据D
+regs[6] = 留白     regs[7] = 留白
+```
+
+2) Wait→Finish：把等待时间"塞满"，并把数据重新排列
+
+在 `recvReduceSendCopy()` 的"等待对端第一批数据"与"预处理"之间，Finish 会把 Flag Thread 的部分数据从奇数槽搬到相邻的偶数槽，从而让所有奇数槽持续为空、专供 flag 使用。非 Flag Thread 则无需搬运。
 
 [src/device/prims_ll128.h:136-142](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L136-L142)
 
@@ -217,11 +201,25 @@ template<int WordPerThread>
 __device__ __forceinline__ void loadRegsFinish(uint64_t(&regs)[WordPerThread]) {
   // Move data out of flag registers into the vacant registers.
   #pragma unroll
-  for (int g=1; g < WordPerThread/2; g+=2) {
-    if (flagThread) regs[2*g] = regs[2*g-1]; // 例如把 regs[1]→regs[2]，regs[5]→regs[6]
+  for (int g=1; g < WordPerThread/2; g+=2) {               // g=1,3
+    if (flagThread) regs[2*g] = regs[2*g-1];              // g=1: regs[2]=regs[1]; g=3: regs[6]=regs[5]
   }
 }
 ```
+
+**对于 Flag Thread (wid=7)，循环行为是**：
+- g=1: `regs[2] = regs[1]` → 把数据B从 regs[1] 复制到 regs[2]
+- g=3: `regs[6] = regs[5]` → 把数据D从 regs[5] 复制到 regs[6]
+
+**Finish 后寄存器状态**：
+```
+regs[0] = 数据A    regs[1] = 留白（待装 flag）
+regs[2] = 数据B    regs[3] = 留白（待装 flag）
+regs[4] = 数据C    regs[5] = 留白（待装 flag）
+regs[6] = 数据D    regs[7] = 留白（待装 flag）
+```
+
+现在所有数据都在**偶数槽** [0,2,4,6]，所有**奇数槽** [1,3,5,7] 空出来给 flag。
 
 关键是 Finish 放在“等待”之后，从而把等待时间与寄存器搬运重叠，见 `GenericOp` 调用序：
 
@@ -261,16 +259,17 @@ __device__ __forceinline__ void storeRegs(T *dst, uint64_t(&regs)[WordPerThread]
 }
 ```
 
-配一张“寄存器三阶段”图会更直观：
+配一张"寄存器三阶段"图会更直观：
 
 <ImageDescription>
-三行对比图，横轴是寄存器槽位索引（0~7），纵轴是“普通线程/Flag 线程”。
-- 阶段 1（Begin）：普通线程 0~7 全蓝（数据）；Flag 线程只有 0/1、4/5 为蓝（数据），2/3、6/7 留白（为 flag 预留）。
-- 阶段 2（Finish）：普通线程不变；Flag 线程将 1→2、5→6 搬运后，0/2/4/6 为蓝（数据），1/3/5/7 留白（为 flag 预留）。
-- 阶段 3（Store to wire）：普通线程写“数据+数据”；Flag 线程在“数据+flag”的 16B 对里使用这些留白槽位写入 flag。
+横向三列对比图，每列显示一个阶段，每列内显示寄存器槽位 0~7 的状态（8 个方块）。
+- 阶段 1（Begin 后）：槽位 0,1,4,5 填充蓝色（数据），槽位 2,3,6,7 空白（留白）
+- 阶段 2（Finish 后）：箭头显示 1→2 和 5→6 的搬运，结果是槽位 0,2,4,6 填充蓝色（数据），槽位 1,3,5,7 空白（待装 flag）
+- 阶段 3（发送时）：槽位 0,2,4,6 保持蓝色（数据），槽位 1,3,5,7 填充红色（flag）
+每个阶段下方标注对应的函数：loadRegsBegin、loadRegsFinish、store128 循环
 </ImageDescription>
 
-关键洞察：两阶段加载把“等待时间”变成“寄存器重排”的机会成本，Flag Thread 以“只装半量+Finish 搬运”的方式，为后续“数据+flag”写回预留奇数组，保持统一的写回循环且不拖累其他线程。
+关键洞察：两阶段加载把"等待时间"变成"寄存器重排"的机会成本，Flag Thread 以"只在 g%2==0 加载+Finish 搬运"的方式，为后续"数据+flag"写回预留奇数槽，保持统一的写回循环且不拖累其他线程。
 
 ---
 
@@ -338,13 +337,12 @@ int wireOffset = WireWordPerSlice*warp + 2*wid; // 2*wid：本线程行内起始
 
 对于 Flag Thread（`wid≡7,15,23,31`），`2*wid≡14 (mod 16)`，正落在每条 128B 行的“倒数第二个 u64”。也就是：`store128` 的第二个 64bit 自然落在“行尾 flag 槽”。
 
-配一张“u 循环时间轴”的图更直观：
+配一张"u 循环时间轴"的图更直观：
 
 <ImageDescription>
-时间轴纵向标出四次迭代（u=0,2,4,6），横向是 lane 0~31。对每次迭代：
-- 普通线程在各自地址写“数据+数据”（16B），标蓝；
-- Flag Thread（7/15/23/31）在各自地址写“数据+flag”（16B），标蓝+红；
-- 侧栏总结：每个 Flag Thread 在 4 次迭代中写 4 个 flag；4 个 Flag Thread 合计覆盖 16 条行。
+纵轴：四次迭代（u=0,2,4,6），横轴：lane 0~31。
+普通线程写"数据+数据"（蓝色），Flag Thread（7/15/23/31）写"数据+flag"（蓝+红）。
+每个 Flag Thread 4 次迭代写 4 个 flag，4 个 Flag Thread 合计覆盖 16 条行。
 </ImageDescription>
 
 关键洞察：统一循环 + 16B 向量写 = 简洁且正确；地址构造让“线程间无冲突”与“Flag Thread 对齐行尾”成为自然结果。
@@ -385,8 +383,8 @@ for (int u=0; u<ELEMS_PER_THREAD; u+=2)
 ```
 
 值得强调两点：
-- `__any_sync` 让等待成为 warp 协同的协议，普通线程虽然不直接检查 flag，但与 Flag Thread 同步前进，避免出现“有人开始规约、有人还在等”的不一致；
-- 第二次整体装载是为了形成“同一时刻”的一致数据视图，消除第一轮轮询期间的潜在抖动。
+- `__any_sync` 让等待成为 warp 协同的协议，普通线程虽然不直接检查 flag，但与 Flag Thread 同步前进，避免出现"有人开始规约、有人还在等"的不一致；
+- **第二次整体装载的真实原因**：轮询期间，**所有线程**（不只是 Flag Thread）都在执行 `load128`，它们可能读到不同"版本"的数据（有些线程读到旧数据，有些读到新数据）。一旦 Flag Thread 通过 `__any_sync` 确认所有 flag 就绪，整个 warp 重新加载，确保**所有线程**读到与 flag 对应的同一版本数据。
 
 2) 多连接接收：逐一套用相同模式
 
@@ -428,11 +426,14 @@ for (int i=1; i<MaxRecv && i<fan.nrecv(); i++) {
 
 这节要解决的问题：为什么单 flag 能在不同链路上成立？节点内靠什么保证“先数据后 flag 的可见顺序”；跨节点时又如何防止被 PCIe/内存/网络打乱？
 
-1) 节点内：16B 写对 + 写入顺序 + fence
+1) 节点内：16B 写对 + 程序顺序 + fence
 
-- 写回使用 `st.volatile.global.v2.u64`，一次性写出“数据+flag”的 16B 对，避免“半写半旧”。
-- NVLink/NVSwitch 等互联在实践中保持写入顺序可见性。当写入顺序为“先数据、后 flag”时，对端也会以同顺序观察到。
-- `postSend()` 在循环尾部执行 `__threadfence()`/`__threadfence_system()`，确保本 GPU 的写入在对外观察上具备有序性。
+节点内保证依赖三层机制：
+
+- **16B 原子写入**：`store128` 使用 `st.volatile.global.v2.u64`，一次性写出"数据+flag"的 16B 对，保证这两个 64bit 的原子可见性（要么都可见，要么都不可见）。
+- **程序顺序**：PTX 内存模型保证同一线程的多次 `store128` 按程序顺序执行。循环内先写数据对，后写 flag 对，这个顺序在指令流中是确定的。
+- **Fence 保证可见性**：`postSend()` 在循环尾部执行 `__threadfence()`（节点内）或 `__threadfence_system()`（Hopper 架构），确保所有写入对其他 GPU 可见。GPU 内存一致性模型保证：fence 之后，所有写入按程序顺序被其他线程观察到。
+- **互联维持顺序**：NVLink/PCIe 等互联维持 GPU 内存模型的顺序语义，不会重排已经由 fence 确定的写入顺序。
 
 2) 跨节点：Proxy 对非 GDR 的逐行校验
 
@@ -456,11 +457,9 @@ if (p == NCCL_PROTO_LL128) {
 }
 ```
 
-这个“GPU fence → Proxy 行检 → 网络发送 → 对端 GPU 轮询”的闭环，抵消了跨越多个子系统的不确定性。
+这个"GPU fence → Proxy 行检 → 网络发送 → 对端 GPU 轮询"的闭环，抵消了跨越多个子系统的不确定性。
 
-口径澄清：执行 `postSend()` 的是“负责发送连接元数据的线程”，它与 Flag Thread 身份无必然关系。
-
-关键洞察：节点内靠“写对 + 顺序 + fence”即可成立；跨节点再加上一层 Proxy 的逐行检验，形成“三明治式”保障。
+关键洞察：节点内靠"写对 + 顺序 + fence"即可成立；跨节点再加上一层 Proxy 的逐行检验，形成"三明治式"保障。
 
 ---
 
@@ -495,7 +494,7 @@ if (RECV) for (int i=0; i < MaxRecv; i++) recvStep[i] += 1;
 if (RECV) postRecv();
 ```
 
-强调：更新步进/发通知的职责与 Flag Thread 身份无关，它们属于“连接元数据”的维护逻辑，和“行尾 flag 的写/验”是两件正交的事。
+**注意**：所有满足 `SEND` 条件的线程都会调用 `postSend()`，但在 `postSend()` 内部有 `if (sendConnTailPtr)` 判断，只有持有连接元数据指针的线程才会执行实际的 fence 和写入操作。更新步进/发通知的职责属于"连接元数据"的维护逻辑，和"行尾 flag 的写/验"是两件正交的事——Flag Thread 的身份不影响是否调用 `postSend()`。
 
 关键洞察：slice 粒度推进让多 warp 天然分区；步进与通知在循环尾部的统一处理，确保生产者/消费者之间的进度协议始终正确。
 
@@ -532,7 +531,7 @@ __syncwarp();
 
 ## 关键洞察
 
-Flag Thread 将“单 flag + 128B 行”的正确性从数据路径中解耦出来：在寄存器阶段为 flag 腾位，在发送阶段用 16B 向量写把“数据+flag”配对可见，在接收阶段以 warp 聚合的轮询把未就绪等待隐藏起来；节点外由 fence + Proxy 逐行校验兜底，最终在不牺牲带宽的前提下维持行级因果与一致性。
+Flag Thread 将"单 flag + 128B 行"的正确性从数据路径中解耦出来：寄存器阶段为 flag 腾位，发送阶段用 16B 向量写实现配对可见，接收阶段用 warp 聚合轮询隐藏等待。节点间通过 fence + Proxy 逐行校验兜底，最终在 93.75% 载荷效率下维持行级因果与一致性。
 
 ---
 

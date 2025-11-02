@@ -4,84 +4,6 @@ NCCL (pronounced "Nickel") is NVIDIA's library providing optimized primitives fo
 
 Version: 2.28.7-1 (see `makefiles/version.mk`)
 
-## Build System
-
-NCCL uses both Makefile and CMake build systems:
-
-### Make-based Build (Primary)
-
-```bash
-# Build NCCL library
-make -j src.build
-
-# Build with custom CUDA path
-make src.build CUDA_HOME=/path/to/cuda
-
-# Build for specific architectures (faster compilation, smaller binary)
-make -j src.build NVCC_GENCODE="-gencode=arch=compute_70,code=sm_70"
-
-# Build examples
-make -j examples
-
-# Build examples with MPI support
-make -j examples MPI=1
-
-# Build with custom NCCL installation
-cd examples && make NCCL_HOME=/path/to/nccl
-```
-
-Build output goes to `build/` directory (configurable via `BUILDDIR`).
-
-### CMake-based Build
-
-```bash
-# Configure with default options
-cmake -S . -B build
-
-# Build
-cmake --build build -j
-
-# Common options
-cmake -S . -B build \
-  -DCUDA_HOME=/path/to/cuda \
-  -DCMAKE_CUDA_ARCHITECTURES="70;80;90" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DVERBOSE=ON \
-  -DDEBUG=ON \
-  -DASAN=ON \
-  -DTRACE=ON \
-  -DWERROR=ON \
-  -DPROFAPI=ON \
-  -DNVTX=ON
-```
-
-### Package Building
-
-```bash
-# Debian/Ubuntu package
-make pkg.debian.build
-ls build/pkg/deb/
-
-# RedHat/CentOS package
-make pkg.redhat.build
-ls build/pkg/rpm/
-
-# OS-agnostic tarball
-make pkg.txz.build
-ls build/pkg/txz/
-```
-
-### Testing
-
-NCCL tests are maintained separately at https://github.com/nvidia/nccl-tests:
-
-```bash
-git clone https://github.com/NVIDIA/nccl-tests.git
-cd nccl-tests
-make
-./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
-```
-
 ## Architecture Overview
 
 ### Core Components
@@ -154,38 +76,6 @@ make
   - `plugin/`: Plugin interfaces (net, tuner, profiler)
   - `nccl_device/`: Device-side API headers
 
-## Examples Directory
-
-Progressive learning path from basic to advanced (see `examples/README.md`):
-
-**Basic Examples** (self-contained, single-file):
-1. `01_communicators/`: Creating/destroying communicators (single/multi-thread/MPI)
-2. `02_point_to_point/`: Send/recv operations in ring pattern
-3. `03_collectives/`: Basic collective communication
-
-**Advanced Features**:
-4. `04_user_buffer_registration/`: User Buffer Registration API
-5. `05_symmetric_memory/`: Symmetric memory/window registration (since 2.27)
-6. `06_device_api/`: Device-side kernel API for fused compute+communication
-
-**Common Directory**: `examples/common/` contains shared bootstrap/broadcast code for advanced examples.
-
-### Running Examples
-
-```bash
-# Threaded mode (default)
-NTHREADS=4 ./example_name
-
-# MPI mode (if built with MPI=1)
-mpirun -np 4 ./example_name
-
-# Control visible GPUs
-CUDA_VISIBLE_DEVICES=0,1,2,3 ./example_name
-
-# Enable debugging
-NCCL_DEBUG=INFO ./example_name
-```
-
 ## Development Patterns
 
 ### API Visibility
@@ -216,26 +106,6 @@ NCCL supports multiple pointer types:
 - `NCCL_PTR_HOST`: System memory
 - `NCCL_PTR_CUDA`: GPU memory
 - `NCCL_PTR_DMABUF`: DMA-BUF support (plugin-dependent)
-
-## Important Build Variables
-
-### Makefile Variables
-- `BUILDDIR`: Build output directory (default: `./build`)
-- `CUDA_HOME`: CUDA installation path (default: `/usr/local/cuda`)
-- `NVCC_GENCODE`: Target GPU architectures
-- `MPI`: Enable MPI support in examples (`0` or `1`)
-- `MPI_HOME`: MPI installation path
-- `NCCL_HOME`: NCCL installation path for examples
-
-### CMake Options
-- `CMAKE_CUDA_ARCHITECTURES`: Target GPU architectures
-- `CMAKE_BUILD_TYPE`: `Release` or `Debug`
-- `DEBUG`, `ASAN`, `UBSAN`: Debugging/sanitizer flags
-- `TRACE`: Enable tracing
-- `PROFAPI`: Enable profiling API (default: ON)
-- `NVTX`: Enable NVTX markers (default: ON)
-- `RDMA_CORE`, `MLX5DV`: InfiniBand features (Linux only)
-- `NET_PROFILER`: Enable network profiler
 
 ## Key Environment Variables
 
@@ -279,30 +149,3 @@ See [NCCL documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/do
 3. Export versioned symbol (e.g., `ncclTunerPlugin_v4`)
 4. Build as `libnccl-tuner-<name>.so`
 5. Set `NCCL_TUNER_PLUGIN=<name>` or absolute path
-
-## Common Commands
-
-```bash
-# Quick build and test
-make -j src.build && make -j examples
-
-# Clean build
-make clean
-
-# Build specific example
-cd examples/03_collectives/01_allreduce && make
-
-# Format check (if available)
-make format
-
-# View version
-cat makefiles/version.mk
-```
-
-## Documentation Links
-
-- [NCCL User Guide](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html)
-- [NCCL Developer Guide](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/index.html)
-- [NCCL Tests Repository](https://github.com/NVIDIA/nccl-tests)
-- [Environment Variables](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html)
-- [Troubleshooting](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting.html)
