@@ -265,6 +265,8 @@ __device__ __forceinline__ void loadRegsFinish(uint64_t(&regs)[WordPerThread]) {
 
 这就是 **两阶段加载的核心价值：把寄存器重排的依赖延迟，隐藏在等待远端数据的时间里**。
 
+对齐处理补充：当用户输入地址非 16B 对齐时，`loadRegsBegin()` 走“misaligned→shmem 中转”分支：先从对齐起点读入共享内存，再按偏移对齐读取到寄存器，最终仍由 `loadRegsFinish()` 完成重排（源码：`src/device/prims_ll128.h:108-140`）。这相当于承担了“DataLoader/对齐适配”的职责，避免非对齐导致的访存退化。
+
 然后，如果 `SrcBuf == Input`，就对本地数据应用 preOp（比如 AllReduce 可能需要先对输入做某种变换）。注意 `if (!flagThread)` 这个条件：Flag Thread 的奇数槽寄存器要留给 flag，所以不做 preOp。
 
 ### 4.3 第三阶段：规约与发送
@@ -352,6 +354,33 @@ store128 (写回环形缓冲区，Flag Thread 写 flag)
 
 ---
 
+## 5. 两层同步机制的必要性（LL128 版）
+
+LL128 仍然依赖“两层同步”来同时满足正确性与吞吐：
+
+- Layer 1：行级验证（细粒度）
+  - 接收时：Flag Thread 在 `recvReduceSendCopy()` 中轮询行尾 flag 是否等于 `step+1`，warp 内用 `__any_sync()` 协同（`src/device/prims_ll128.h:181-201`）。
+  - 发送时：Flag Thread 在 `store128()` 时写入行尾 flag，其它线程写入数据（`src/device/prims_ll128.h:260-286`）。
+
+- Layer 2：Step 级流控（粗粒度）
+  - 发送前使用 `waitSend()` 基于 head/tail 检查空间（`src/device/prims_ll128.h:58-69`）。
+  - 完成后 `postSend()`/`postRecv()` 更新 tail/head（`src/device/prims_ll128.h:319-323`）。
+
+与 LL 的差异（澄清而非展开对比）：
+- LL 使用 32 位 flag 并引入 `NCCL_LL_CLEAN_MASK` 做预防性清理以避免回绕误判（`src/include/device.h:90-113`, `src/device/prims_ll.h:64,83`）。
+- LL128 使用 64 位 flag，节点间非 GDR 路径由 Proxy 在 CPU 侧逐行校验 flag 后再发网（`src/transport/net.cc:1268-1296`），因此不需要 LL 的清理机制；GDR 路径依赖 `__threadfence_system()` 的跨设备可见性。
+
+**关键洞察：Step 控制宏观节拍、防止覆盖；行级 flag 保障微观完整。单 flag + Flag Thread + Proxy 校验让 LL128 在不引入清理机制的前提下维持行级一致性。**
+
+<ImageDescription>
+并行关系示意：
+- 纵向：Step（粗粒度）—— waitSend → 循环处理 → postSend/postRecv
+- 横向：行（细粒度）—— Flag Thread 轮询/盖章与数据 load/store 并行
+突出“粗细两层”在时间轴上的互补关系。
+</ImageDescription>
+
+---
+
 ## 6. 多 warp 协同与地址分配
 
 ### 6.1 wireOffset 的初始化与推进
@@ -377,6 +406,12 @@ wireOffset += WireWordPerSlice*nwarps;
 每个 warp 内有 4 个 Flag Thread（`tid % 8 == 7` 的线程，lanes 7/15/23/31），负责写入和验证 flag。如果有 8 个 warp，那么总共有 `8 × 4 = 32` 个 Flag Thread（Flag Thread 写入逻辑见发送环节 [`src/device/prims_ll128.h:260-286`](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/device/prims_ll128.h#L260-L286)）。
 
 但每个 warp 只负责自己的 16 条 128B 行。这 16 条行需要 16 个 flag，恰好由一个 warp 的 4 个 Flag Thread 覆盖。原因是：**每个 Flag Thread 在 `recvReduceSendCopy()` 的循环里写 4 次 flag**（`for (int u=0; u<ELEMS_PER_THREAD; u+=2)` 共迭代 4 次，`ELEMS_PER_THREAD = 8`），所以每个 Flag Thread 负责 4 条行，4 个 Flag Thread 共覆盖 16 条行。
+
+<ImageDescription>
+warp×行×Flag Thread 覆盖图：
+- 横轴：16 条 128B 行；纵轴：warp 内 32 lanes（标注 lanes 7/15/23/31 为 Flag Thread）。
+- 用不同标注区分每个 Flag Thread 覆盖的 4 条行尾 flag 槽位。
+</ImageDescription>
 
 ### 6.3 多 warp 的 barrier
 

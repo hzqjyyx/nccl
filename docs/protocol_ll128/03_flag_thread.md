@@ -557,3 +557,7 @@ Flag Thread 将"单 flag + 128B 行"的正确性从数据路径中解耦出来�
 - WireWordPerSlice：每轮 warp 处理的 u64 槽数（=32×8=256）。
 - DataEltPerSlice：每轮 warp 处理的“用户元素”数量（扣掉 flag 位后计算）。
 - GDR（GPU Direct RDMA）：网卡直访 GPU 内存；非 GDR 时数据落系统内存，需 Proxy 校验。
+
+补充（术语来源）：
+- WARP_MASK：`0xffffffff`，用于 `__any_sync` 的 warp 全掩码，定义见 src/device/prims_ll128.h（同版本源码）。
+- ELEMS_PER_THREAD：本文中循环使用的模板参数，取值等于 `NCCL_LL128_SHMEM_ELEMS_PER_THREAD=8`，定义见 [src/include/device.h:112](https://github.com/NVIDIA/nccl/blob/v2.28.7-1/src/include/device.h#L112)。
