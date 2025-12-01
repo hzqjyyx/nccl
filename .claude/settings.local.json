@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//root/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

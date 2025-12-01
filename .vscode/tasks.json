@@ -1,0 +1,26 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build-debug",
+            "type": "shell",
+            "command": "make clean && make MPI=1 MPI_HOME=/usr/ NCCL_HOME=/workspace/nccl/build/lib/ CUDA_HOME=/usr/local/cuda/ DEBUG=1",
+            "args": [],
+            "options": {
+                "cwd": "${workspaceFolder}/examples/01_communicators/03_one_device_per_process_mpi"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            }
+        }
+    ]
+}
+

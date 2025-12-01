@@ -5,3 +5,6 @@
 .DS_Store
 .obsidian/
 .drafts/
+
+one_device_per_process_mpi
+*.o

@@ -522,8 +522,8 @@ static ncclResult_t socketTryAccept(struct ncclSocket* sock) {
              errno == EINTR) {
     /* per accept's man page, for linux sockets, the following errors might be already pending errors
      * 根据 accept 的 man page，以下错误可能是已挂起的错误（网络问题）
-     * and should be considered as EAGAIN. To avoid infinite loop in case of errors, we use the retry count*/
-     * 应视为 EAGAIN（可重试）。为避免无限循环，使用重试计数器限制
+     * and should be considered as EAGAIN. To avoid infinite loop in case of errors, we use the retry count
+     * 应视为 EAGAIN 可重试。为避免无限循环，使用重试计数器限制 */
     if (++sock->errorRetries == ncclParamRetryCnt()) {
       WARN("socketTryAccept: exceeded error retry count after %d attempts, %s", sock->errorRetries, strerror(errno));
       return ncclSystemError;

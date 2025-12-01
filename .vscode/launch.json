@@ -1,0 +1,132 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug NCCL MPI (via mpirun - 1 process)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "/usr/bin/mpirun",
+            "args": [
+                "-np",
+                "1",
+                "--allow-run-as-root",
+                "${workspaceFolder}/examples/01_communicators/03_one_device_per_process_mpi/one_device_per_process_mpi"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/examples/01_communicators/03_one_device_per_process_mpi",
+            "environment": [
+                {
+                    "name": "LD_LIBRARY_PATH",
+                    "value": "${workspaceFolder}/build/lib:${env:LD_LIBRARY_PATH}"
+                },
+                {
+                    "name": "NCCL_DEBUG",
+                    "value": "DEBUG"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set follow-fork-mode to child (track the actual MPI process)",
+                    "text": "-gdb-set follow-fork-mode child",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Allow pending breakpoints so child processes pick them up",
+                    "text": "-gdb-set breakpoint pending on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set detach-on-fork off (keep all processes under debugger control)",
+                    "text": "-gdb-set detach-on-fork off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set schedule-multiple on (allow debugging multiple processes)",
+                    "text": "-gdb-set schedule-multiple on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set non-stop mode off (all-stop mode for better control)",
+                    "text": "-gdb-set non-stop off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Load all symbols and enable macro debugging",
+                    "text": "-gdb-set print symbol-filename on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set solib-search-path to find libsuccl.so with debug symbols",
+                    "text": "-gdb-set solib-search-path ${workspaceFolder}/build/src:${workspaceFolder}/build/src/.libs",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Auto-load shared library symbols",
+                    "text": "-gdb-set auto-load safe-path /",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build-debug",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "logging": {
+                "moduleLoad": false,
+                "trace": false,
+                "engineLogging": false
+            },
+            // "additionalSOLibSearchPath": "${workspaceFolder}/build/src:${workspaceFolder}/build/src/.libs"
+        },
+        {
+            "name": "Debug SUCCL MPI (via mpirun - 8 processes)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "/usr/bin/mpirun",
+            "args": [
+                "-np",
+                "8",
+                "--allow-run-as-root",
+                "${workspaceFolder}/examples/01_communicators/one_device_per_process_mpi_load_libnccl/one_device_per_process_mpi"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/examples/01_communicators/one_device_per_process_mpi_load_libnccl",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set follow-fork-mode to child",
+                    "text": "-gdb-set follow-fork-mode child",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set detach-on-fork off",
+                    "text": "-gdb-set detach-on-fork off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Enable schedule-multiple for multi-process debugging",
+                    "text": "-gdb-set schedule-multiple on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set non-stop mode off (all-stop mode for MPI)",
+                    "text": "-gdb-set non-stop off",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build-debug",
+            "miDebuggerPath": "/usr/bin/gdb"
+        }
+    ]
+}
