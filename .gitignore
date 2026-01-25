@@ -8,3 +8,5 @@
 
 one_device_per_process_mpi
 *.o
+.cache
+examples/03_collectives/01_allreduce/allreduce

@@ -1,0 +1,4 @@
+cmake .. -DCMAKE_BUILD_TYPE=Debug -DDEBUG=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+make -j$(nproc)
+
+make DEBUG=1 NVCC_GENCODE="-gencode=arch=compute_86,code=sm_86"
