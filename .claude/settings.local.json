@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Read(//root/**)"
+      "Read(//root/**)",
+      "Bash(wc:*)"
     ],
     "deny": [],
     "ask": []
