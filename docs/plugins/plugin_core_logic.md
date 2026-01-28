@@ -29,68 +29,71 @@ Plugin 机制的核心思想是：**把可替换的实现从 NCCL 核心中解�
 先看一张全景图，理解调用关系：
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           NCCL Core                                      │
-│  (init.cc, transport/net.cc, graph/topo.cc, enqueue.cc, proxy.cc ...)   │
-│                                                                          │
-│  在不同阶段调用 plugin 管理层提供的接口：                                  │
-│  - 初始化时调用 ncclNetInit()                                            │
-│  - 拓扑检测时通过 comm->ncclNet->getProperties() 查询网卡                 │
-│  - 数据传输时通过 comm->ncclNet->isend/irecv/test() 收发数据              │
-└─────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                           NCCL Core                                       │
+│  (init.cc, transport/net.cc, graph/topo.cc, enqueue.cc, proxy.cc ...)     │
+│                                                                           │
+│  Calls plugin management layer interfaces at different stages:            │
+│  - Calls ncclNetInit() during initialization                              │
+│  - Queries NICs via comm->ncclNet->getProperties() during topology scan   │
+│  - Sends/receives data via comm->ncclNet->isend/irecv/test()              │
+└───────────────────────────────────────────────────────────────────────────┘
                                     │
-                                    │ 调用
+                                    │ calls
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        Plugin 管理层                                     │
+│                     Plugin Management Layer                             │
 │                                                                         │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐       │
-│  │   net.cc    │ │  tuner.cc   │ │ profiler.cc │ │   env.cc    │       │
-│  │             │ │             │ │             │ │             │       │
-│  │ 管理多个      │ │ 管理单个     │ │ 管理单个     │ │ 管理单个      │       │
-│  │ Net Plugin  │ │ Tuner       │ │ Profiler    │ │ Env         │       │
-│  │ 状态机       │ │ Plugin      │ │ Plugin +    │ │ Plugin      │       │
-│  │ 引用计数     │ │             │ │ 事件记录      │ │             │       │
-│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘ └──────┬──────┘       │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │
+│  │   net.cc    │ │  tuner.cc   │ │ profiler.cc │ │   env.cc    │        │
+│  │             │ │             │ │             │ │             │        │ 
+│  │ Manages     │ │ Manages     │ │ Manages     │ │ Manages     │        │
+│  │ multiple    │ │ single      │ │ single      │ │ single      │        │ 
+│  │ Net Plugins │ │ Tuner       │ │ Profiler    │ │ Env         │        │
+│  │ state       │ │ Plugin      │ │ Plugin +    │ │ Plugin      │        │
+│  │ machine     │ │             │ │ event       │ │             │        │
+│  │ ref count   │ │             │ │ recording   │ │             │        │
+│  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘ └──────┬──────┘        │
 │         │               │               │               │               │
 │         └───────────────┴───────────────┴───────────────┘               │
-│                                    │                                     │
-└────────────────────────────────────┼─────────────────────────────────────┘
-                                     │ 调用
+│                                    │                                    │
+└────────────────────────────────────┼────────────────────────────────────┘
+                                     │ calls
+                                     ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                  Common Loading Layer (plugin_open.cc)                         │
+│                                                                                │
+│  Provides 4 loading functions (all call the same openPluginLib):               │
+│  - ncclOpenNetPluginLib()                                                      │
+│  - ncclOpenTunerPluginLib()                                                    │
+│  - ncclOpenProfilerPluginLib()                                                 │
+│  - ncclOpenEnvPluginLib()                                                      │
+│                                                                                │
+│  Responsibility: dlopen libs, resolve lib names (mynet → libnccl-net-mynet.so) │
+└────────────────────────────────────────────────────────────────────────────────┘
+                                     │ calls
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                      通用加载层 (plugin_open.cc)                         │
-│                                                                          │
-│  提供 4 个加载函数（内部都调用同一个 openPluginLib）：                     │
-│  - ncclOpenNetPluginLib()                                                │
-│  - ncclOpenTunerPluginLib()                                              │
-│  - ncclOpenProfilerPluginLib()                                           │
-│  - ncclOpenEnvPluginLib()                                                │
-│                                                                          │
-│  职责：dlopen 动态库，处理库名解析（mynet → libnccl-net-mynet.so）        │
-└─────────────────────────────────────────────────────────────────────────┘
-                                     │ 调用
-                                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      版本适配层 (net/net_v*.cc 等)                        │
-│                                                                          │
+│                  Version Adapter Layer (net/net_v*.cc etc.)             │
+│                                                                         │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                     │
 │  │ net_v11.cc   │ │ net_v10.cc   │ │ net_v6.cc    │ ...                 │
-│  │ (最新，直通) │ │ (适配层)     │ │ (适配层)     │                     │
+│  │ (latest,     │ │ (adapter)    │ │ (adapter)    │                     │
+│  │  passthru)   │ │              │ │              │                     │
 │  └──────────────┘ └──────────────┘ └──────────────┘                     │
-│                                                                          │
-│  职责：dlsym 查找符号，旧版本接口适配到新版本                             │
+│                                                                         │
+│  Responsibility: dlsym symbol lookup, adapt old API versions to new     │
 └─────────────────────────────────────────────────────────────────────────┘
-                                     │ 加载
+                                     │ loads
                                      ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         外部 Plugin (.so 文件)                           │
+┌──────────────────────────────────────────────────────────────────────────┐
+│                       External Plugins (.so files)                       │
 │                                                                          │
-│  - libnccl-net-mynet.so     导出 ncclNetPlugin_v11 符号                  │
-│  - libnccl-tuner-xxx.so     导出 ncclTunerPlugin_v5 符号                 │
-│  - libnccl-profiler-xxx.so  导出 ncclProfilerPlugin_v5 符号              │
-│  - libnccl-env-xxx.so       导出 ncclEnvPlugin_v1 符号                   │
-└─────────────────────────────────────────────────────────────────────────┘
+│  - libnccl-net-mynet.so     exports ncclNetPlugin_v11 symbol             │
+│  - libnccl-tuner-xxx.so     exports ncclTunerPlugin_v5 symbol            │
+│  - libnccl-profiler-xxx.so  exports ncclProfilerPlugin_v5 symbol         │
+│  - libnccl-env-xxx.so       exports ncclEnvPlugin_v1 symbol              │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 **关键点**：
@@ -334,10 +337,10 @@ ncclNetInit(comm)
        │
        ▼
 ┌──────────────────────────────────┐
-│ std::call_once: 初始化插件列表    │  ← 全局只执行一次
-│ - 解析 NCCL_NET_PLUGIN 环境变量   │
-│ - 填充 netPluginLibs[] 数组       │
-│ - 添加内置 IB 和 Socket plugin    │
+│ std::call_once: init plugin list │  ← executes only once globally
+│ - parse NCCL_NET_PLUGIN env var  │
+│ - populate netPluginLibs[] array │
+│ - add built-in IB & Socket plugin│
 └──────────────────────────────────┘
        │
        ▼
@@ -348,12 +351,12 @@ ncclNetInit(comm)
 │       ncclNetPluginLoad()        │  ← dlopen + dlsym
 │                                  │
 │   if InitReady:                  │
-│       ncclNetPluginInit()        │  ← 调用 plugin->init()
+│       ncclNetPluginInit()        │  ← call plugin->init()
 │                                  │
 │   if Enabled:                    │
-│       ncclNetPluginAssignToComm()│  ← 绑定到 comm
-│       if 成功:                   │
-│           禁用其他外部 plugin     │
+│       ncclNetPluginAssignToComm()│  ← bind to comm
+│       if success:                │
+│           disable other ext plugin│
 │           return                 │
 └──────────────────────────────────┘
 ```
