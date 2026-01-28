@@ -20,14 +20,15 @@ NCCL IB Plugin 的核心思想是：用一个 RDMA Write with Immediate 来同�
 ```
 Sender                              Receiver
   |                                    |
-  |   [1] 等待接收方准备好              |
-  |   <---- FIFO (rkey + addr) -----   | [2] 接收方告诉发送方：数据往这里写
+  |   [1] Wait for receiver ready      |
+  |   <---- FIFO (rkey + addr) -----   | [2] Receiver tells sender: write data here
   |                                    |
-  |   [3] RDMA Write 直接写入远程内存   |
+  |   [3] RDMA Write directly to       |
+  |       remote memory                |
   |   ========= DATA =============>    |
   |                                    |
   |   [4] RDMA Write with Immediate    |
-  |   ---- IMM (size) ------>          | [5] 接收方收到 CQE，知道数据到了
+  |   ---- IMM (size) ------>          | [5] Receiver gets CQE, knows data arrived
   |                                    |
 ```
 
@@ -40,15 +41,15 @@ Sender                              Receiver
 |                                                                  |
 |   +------------------+          +------------------+             |
 |   |  ncclIbSendComm  |          |  ncclIbRecvComm  |             |
-|   |  (发送端连接)     |          |  (接收端连接)     |             |
+|   | (send-side conn) |          | (recv-side conn) |             |
 |   +------------------+          +------------------+             |
 |          |                              |                        |
 |          v                              v                        |
 |   +------------------+          +------------------+             |
 |   | ncclIbSendCommDev|          | ncclIbRecvCommDev|             |
-|   | (每个IB设备一个)  |          | (每个IB设备一个)  |             |
-|   |   - pd (保护域)  |          |   - pd (保护域)  |             |
-|   |   - cq (完成队列) |          |   - cq (完成队列) |             |
+|   | (one per IB dev) |          | (one per IB dev) |             |
+|   |   - pd (prot dom)|          |   - pd (prot dom)|             |
+|   |   - cq (comp que)|          |   - cq (comp que)|             |
 |   |   - fifoMr       |          |   - fifoMr       |             |
 |   +------------------+          +------------------+             |
 |          |                              |                        |
@@ -58,7 +59,7 @@ Sender                              Receiver
 |               +------------------+                               |
 |               |    ncclIbQp      |                               |
 |               |   (Queue Pair)   |                               |
-|               |  连接发送和接收   |                               |
+|               | connects snd/rcv |                               |
 |               +------------------+                               |
 |                                                                  |
 +------------------------------------------------------------------+
@@ -66,9 +67,9 @@ Sender                              Receiver
           v                                v
 +------------------+              +------------------+
 |   ncclIbDev      |              |   ncclIbMrCache  |
-|  (物理IB设备)     |              |   (MR 缓存)       |
+| (physical IB dev)|              |    (MR cache)    |
 |   - context      |              |   - slots[]      |
-|   - pd (共享)    |              |   - 引用计数      |
+|   - pd (shared)  |              |   - ref count    |
 +------------------+              +------------------+
 ```
 
@@ -82,23 +83,23 @@ ncclIbListen()                     ncclIbConnect()
     v                                   v
 ncclSocketListen()                 ncclSocketConnect()
     |                                   |
-    |<-------- TCP 连接 --------        |
+    |<------ TCP connection ------      |
     v                                   v
-ncclIbAccept()                     交换 vProps
+ncclIbAccept()                     exchange vProps
     |                                   |
     v                                   v
-为每个 IB 设备:                    为每个 IB 设备:
+For each IB device:                For each IB device:
   ncclIbInitCommDevBase()            ncclIbInitCommDevBase()
     - ibv_alloc_pd()                   - ibv_alloc_pd()
     - ibv_create_cq()                  - ibv_create_cq()
     |                                   |
     v                                   v
-为每个 QP:                         为每个 QP:
+For each QP:                       For each QP:
   ncclIbCreateQp()                   ncclIbCreateQp()
     - ibv_create_qp()                  - ibv_create_qp()
     - ibv_modify_qp(INIT)              - ibv_modify_qp(INIT)
     |                                   |
-    |<------ 交换 QP 信息 ------        |
+    |<----- exchange QP info -----      |
     v                                   v
   ncclIbRtrQp()                      ncclIbRtrQp()
     - ibv_modify_qp(RTR)               - ibv_modify_qp(RTR)
@@ -120,10 +121,10 @@ ibv_post_recv()                        |
 ncclIbPostFifo()                       |
     |                                  |
     v                                  |
-RDMA Write (FIFO 信息)                 |
+RDMA Write (FIFO info)                 |
     |-------- FIFO ---------->         |
     |                                  v
-    |                             等待 FIFO 到达
+    |                             wait for FIFO arrival
     |                                  |
     |                                  v
     |                             ncclIbMultiSend()
@@ -141,7 +142,7 @@ ncclIbTest()                       ncclIbTest()
 ibv_poll_cq()                      ibv_poll_cq()
     |                                  |
     v                                  v
-检查 wc.opcode ==                  检查 wc.status ==
+check wc.opcode ==                 check wc.status ==
 IBV_WC_RECV_RDMA_WITH_IMM          IBV_WC_SUCCESS
 ```
 
@@ -334,28 +335,28 @@ IB 的 Queue Pair 有严格的状态转换要求：
 
 ```
     +-------+
-    | RESET |  <-- ibv_create_qp() 创建后的初始状态
+    | RESET |  <-- Initial state after ibv_create_qp()
     +-------+
         |
         | ibv_modify_qp(IBV_QPS_INIT)
-        | 设置: port_num, pkey, access_flags
+        | Set: port_num, pkey, access_flags
         v
     +------+
-    | INIT |   <-- 可以 post_recv，但不能 post_send
+    | INIT |   <-- Can post_recv, but cannot post_send
     +------+
         |
         | ibv_modify_qp(IBV_QPS_RTR)  Ready To Receive
-        | 设置: dest_qp_num, ah_attr (路径信息)
+        | Set: dest_qp_num, ah_attr (path info)
         v
     +-----+
-    | RTR |    <-- 可以接收数据
+    | RTR |    <-- Can receive data
     +-----+
         |
         | ibv_modify_qp(IBV_QPS_RTS)  Ready To Send
-        | 设置: timeout, retry_cnt, sq_psn
+        | Set: timeout, retry_cnt, sq_psn
         v
     +-----+
-    | RTS |    <-- 可以发送和接收数据
+    | RTS |    <-- Can send and receive data
     +-----+
 ```
 
@@ -973,27 +974,27 @@ if (nreqs > 1 || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold())) {
 - 传输 4KB 数据
 
 ```
-时间线                Rank 0 (Sender)              Rank 1 (Receiver)
+Timeline              Rank 0 (Sender)              Rank 1 (Receiver)
 --------------------------------------------------------------------
-  T0    连接建立
+  T0    Connection Setup
         |
         |-- ncclIbConnect() -----------------> ncclIbAccept()
-        |   创建 QP (RESET -> INIT)            创建 QP (RESET -> INIT)
+        |   Create QP (RESET -> INIT)          Create QP (RESET -> INIT)
         |
-        |<---- 交换 QP 信息 (via TCP) -------->
+        |<---- Exchange QP info (via TCP) ---->
         |
         |   ncclIbRtrQp() + ncclIbRtsQp()      ncclIbRtrQp() + ncclIbRtsQp()
-        |   QP 进入 RTS 状态                   QP 进入 RTS 状态
+        |   QP enters RTS state                QP enters RTS state
         |
-  T1    接收方准备
+  T1    Receiver Preparation
         |                                      |
         |                                      v
         |                                   ncclIbIrecv(recvBuf, 4KB)
         |                                      |
-        |                                      +-- ibv_post_recv()  [等待 IMM]
+        |                                      +-- ibv_post_recv()  [Wait for IMM]
         |                                      |
         |                                      +-- ncclIbPostFifo()
-        |                                          填充 FIFO:
+        |                                          Fill FIFO:
         |                                            addr = recvBuf
         |                                            rkey = mr->rkey
         |                                            size = 4KB
@@ -1001,34 +1002,34 @@ if (nreqs > 1 || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold())) {
         |                                          |
         |<======= RDMA Write (FIFO) ================|
         |
-  T2    发送方检查 FIFO
+  T2    Sender Checks FIFO
         |
         v
      ncclIbIsend(sendBuf, 4KB)
         |
-        +-- 检查 fifo[slot].idx == 1?
-        |   是! FIFO 已到达
+        +-- Check fifo[slot].idx == 1?
+        |   Yes! FIFO has arrived
         |
         +-- ncclIbMultiSend()
             |
-            +-- 准备 RDMA Write:
+            +-- Prepare RDMA Write:
             |     wr.opcode = IBV_WR_RDMA_WRITE
             |     sge.addr = sendBuf
-            |     wr.remote_addr = recvBuf (从 FIFO 获取)
-            |     wr.rkey = rkey (从 FIFO 获取)
+            |     wr.remote_addr = recvBuf (from FIFO)
+            |     wr.rkey = rkey (from FIFO)
             |
-            +-- 准备 RDMA Write with IMM:
+            +-- Prepare RDMA Write with IMM:
             |     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM
-            |     wr.imm_data = 4096 (数据大小)
+            |     wr.imm_data = 4096 (data size)
             |     wr.send_flags = IBV_SEND_SIGNALED
             |
             +-- ibv_post_send()
                 |
                 |======= RDMA Write (4KB) ===================>
-                |                                            数据直接写入 recvBuf
+                |                                            Data written to recvBuf
                 |------- IMM (4096) ------------------------->
-                                                             生成 CQE
-  T3    完成确认
+                                                             CQE generated
+  T3    Completion Acknowledgment
         |                                      |
         v                                      v
      ncclIbTest()                           ncclIbTest()

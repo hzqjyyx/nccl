@@ -26,40 +26,40 @@ Socket Plugin 的设计遵循三个原则：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                            NCCL Proxy 线程                                   │
-│                                                                              │
-│  调用 Net Plugin 接口：isend() / irecv() / test()                            │
+│                            NCCL Proxy Thread                                │
+│                                                                             │
+│  Calls Net Plugin interface: isend() / irecv() / test()                     │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      │
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Socket Plugin (net_socket.cc)                       │
-│                                                                              │
+│                          Socket Plugin (net_socket.cc)                      │
+│                                                                             │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │                         ncclNetSocketComm                              │  │
-│  │                                                                        │  │
-│  │   ctrlSock (控制 socket)                                               │  │
+│  │                         ncclNetSocketComm                             │  │
+│  │                                                                       │  │
+│  │   ctrlSock (control socket)                                           │  │
 │  │   ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │   │ 用于传输 size 和 inline data，由主线程处理                         │ │  │
+│  │   │ Transfers size and inline data, handled by main thread          │ │  │
 │  │   └─────────────────────────────────────────────────────────────────┘ │  │
-│  │                                                                        │  │
-│  │   socks[0..N-1] (数据 socket 数组)                                     │  │
-│  │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐                    │  │
-│  │   │ sock[0] │ │ sock[1] │ │ sock[2] │ │ sock[3] │ ...                │  │
-│  │   └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘                    │  │
+│  │                                                                       │  │
+│  │   socks[0..N-1] (data socket array)                                   │  │
+│  │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐                     │  │
+│  │   │ sock[0] │ │ sock[1] │ │ sock[2] │ │ sock[3] │ ...                 │  │
+│  │   └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘                     │  │
 │  │        │           │           │           │                          │  │
 │  │        └───────────┴─────┬─────┴───────────┘                          │  │
-│  │                          │                                             │  │
-│  │                          ▼                                             │  │
-│  │   helperThread[0..M-1] (工作线程数组)                                   │  │
+│  │                          │                                            │  │
+│  │                          ▼                                            │  │
+│  │   helperThread[0..M-1] (worker thread array)                          │  │
 │  │   ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                  │  │
 │  │   │ Thread 0     │ │ Thread 1     │ │ Thread 2     │ ...              │  │
-│  │   │ 负责 sock    │ │ 负责 sock    │ │ 负责 sock    │                  │  │
+│  │   │ handles sock │ │ handles sock │ │ handles sock │                  │  │
 │  │   │ [0,M-1]      │ │ [M,2M-1]     │ │ [2M,3M-1]    │                  │  │
 │  │   └──────────────┘ └──────────────┘ └──────────────┘                  │  │
-│  │                                                                        │  │
+│  │                                                                       │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -117,25 +117,25 @@ struct ncclNetSocketComm {
 ```
 ncclNetSocketComm
 ┌────────────────────────────────────────────────────────────────────┐
-│                                                                     │
-│   ┌─────────────┐                                                   │
-│   │  ctrlSock   │  控制 socket：传输 size 和 inline data           │
-│   └─────────────┘                                                   │
-│                                                                     │
+│                                                                    │
+│   ┌─────────────┐                                                  │
+│   │  ctrlSock   │  control socket: transfers size and inline data  │
+│   └─────────────┘                                                  │
+│                                                                    │
 │   ┌─────────────────────────────────────────────────────────────┐  │
 │   │  socks[0]   │  socks[1]   │  socks[2]   │ ... │  socks[N-1] │  │
 │   └─────────────────────────────────────────────────────────────┘  │
-│   数据 socket 数组：并行传输大块数据                                 │
-│                                                                     │
+│   data socket array: parallel transfer of large data chunks        │
+│                                                                    │
 │   ┌────────────────────────────────────────────────────────────────┐
 │   │  requests[0..31]                                               │
-│   │  预分配的请求对象，isend/irecv 时从中分配                       │
+│   │  pre-allocated request objects, assigned during isend/irecv    │
 │   └────────────────────────────────────────────────────────────────┘
-│                                                                     │
-│   nSocks = 8           实际使用 8 个数据 socket                     │
-│   nThreads = 2         使用 2 个工作线程                            │
-│   nextSock = 0         下一个分配的 socket 索引                     │
-│                                                                     │
+│                                                                    │
+│   nSocks = 8           actually uses 8 data sockets                │
+│   nThreads = 2         uses 2 worker threads                       │
+│   nextSock = 0         index of next socket to assign              │
+│                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -166,16 +166,17 @@ struct ncclNetSocketRequest {
 Request 状态图：
 
 ```
-         isend()/irecv()                    test() 中交换 size
+         isend()/irecv()                    size exchanged in test()
               │                                    │
               ▼                                    ▼
 ┌────────────────┐      ┌────────────────┐      ┌────────────────┐
 │    used = 0    │ ───► │    used = 1    │ ───► │    used = 2    │
-│    (空闲)      │      │ (已发起，等待  │      │ (size已交换，  │
-│                │      │  交换size)     │      │  等待数据完成) │
+│    (idle)      │      │ (initiated,    │      │ (size exchanged│
+│                │      │  waiting for   │      │  waiting for   │
+│                │      │  size exchange)│      │  data transfer)│
 └────────────────┘      └────────────────┘      └────────────────┘
          ▲                                             │
-         │              所有子任务完成                   │
+         │              all subtasks completed         │
          └─────────────────────────────────────────────┘
 ```
 
@@ -201,28 +202,28 @@ struct ncclNetSocketTask {
 关系图：
 
 ```
-一个 Request 拆分成多个 Task
+A Request is split into multiple Tasks
 ┌─────────────────────────────────────────────────────────────────────┐
-│  ncclNetSocketRequest                                                │
-│                                                                      │
-│  data ───────────────────────────────────────────────►               │
-│  size = 1MB                                                          │
-│                                                                      │
-│  拆分为 4 个 Task（每个 256KB）：                                     │
-│                                                                      │
+│  ncclNetSocketRequest                                               │
+│                                                                     │
+│  data ───────────────────────────────────────────────►              │
+│  size = 1MB                                                         │
+│                                                                     │
+│  Split into 4 Tasks (256KB each):                                   │
+│                                                                     │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
 │  │ Task[0]  │  │ Task[1]  │  │ Task[2]  │  │ Task[3]  │             │
 │  │ data+0   │  │ data+256K│  │ data+512K│  │ data+768K│             │
 │  │ size=256K│  │ size=256K│  │ size=256K│  │ size=256K│             │
 │  │ sock[0]  │  │ sock[1]  │  │ sock[2]  │  │ sock[3]  │             │
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘             │
-│       │             │             │             │                    │
-│       ▼             ▼             ▼             ▼                    │
-│  ┌──────────┐  ┌──────────┐                                          │
-│  │ Thread 0 │  │ Thread 1 │   假设 nThreads=2, nSocks=4             │
-│  │处理 Task │  │处理 Task │   Thread 0 负责 sock[0,1]               │
-│  │ [0,1]    │  │ [2,3]    │   Thread 1 负责 sock[2,3]               │
-│  └──────────┘  └──────────┘                                          │
+│       │             │             │             │                   │
+│       ▼             ▼             ▼             ▼                   │
+│  ┌──────────┐  ┌──────────┐                                         │
+│  │ Thread 0 │  │ Thread 1 │   Assuming nThreads=2, nSocks=4         │
+│  │ processes│  │ processes│   Thread 0 handles sock[0,1]            │
+│  │ Task[0,1]│  │ Task[2,3]│   Thread 1 handles sock[2,3]            │
+│  └──────────┘  └──────────┘                                         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -271,29 +272,29 @@ enum ncclNetSocketCommState {
 ```
 Rank 0 (sender)                        Rank 1 (receiver)
      │                                        │
-     │      1. bootstrap 传递 handle           │
+     │      1. bootstrap passes handle        │
      │  ◄──────────────────────────────────   │
      │                                        │
-     │      2. connect() 多次调用              │
-     ├──────────────────────────────────────►│ accept() 多次调用
-     │         socket[0] 连接                 │
-     ├──────────────────────────────────────►│
-     │         socket[1] 连接                 │
-     ├──────────────────────────────────────►│
+     │      2. connect() called multiple times│
+     ├──────────────────────────────────────► │ accept() called multiple times
+     │         socket[0] connects             │
+     ├──────────────────────────────────────► │
+     │         socket[1] connects             │
+     ├──────────────────────────────────────► │
      │           ...                          │
-     ├──────────────────────────────────────►│
-     │         ctrlSock 连接                  │
+     ├──────────────────────────────────────► │
+     │         ctrlSock connects              │
      │                                        │
-     │      3. 握手：发送 socket 索引          │
-     │         "我是 socket 0"                │
-     │  ─────────────────────────────────►   │
-     │         "我是 socket 1"                │
-     │  ─────────────────────────────────►   │
+     │      3. handshake: send socket index   │
+     │         "I am socket 0"                │
+     │  ─────────────────────────────────►    │
+     │         "I am socket 1"                │
+     │  ─────────────────────────────────►    │
      │           ...                          │
-     │         "我是 ctrlSock"                │
-     │  ─────────────────────────────────►   │
+     │         "I am ctrlSock"                │
+     │  ─────────────────────────────────►    │
      │                                        │
-     │      4. 连接完成                        │
+     │      4. connection complete            │
      │                                        │
 ```
 
@@ -518,7 +519,7 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
 ### test() 流程图
 
 ```
-                        test() 被调用
+                        test() is called
                               │
                               ▼
                     ┌─────────────────┐
@@ -529,20 +530,23 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
               │ Yes                         │ No (used == 2)
               ▼                             │
     ┌─────────────────────┐                 │
-    │ 阶段1：交换 size     │                 │
+    │ Phase 1: Exchange   │                 │
+    │          size       │                 │
     │                     │                 │
-    │ SEND: 发送 size +   │                 │
+    │ SEND: send size +   │                 │
     │       inline data   │                 │
     │                     │                 │
-    │ RECV: 接收 size,    │                 │
-    │       更新实际大小   │                 │
+    │ RECV: receive size, │                 │
+    │       update actual │                 │
+    │       size          │                 │
     └──────────┬──────────┘                 │
                │                            │
-               │ size 交换完成              │
+               │ size exchange complete     │
                ▼                            │
     ┌─────────────────────┐                 │
-    │ 拆分成多个 Task      │                 │
-    │ 分配给工作线程       │                 │
+    │ Split into Tasks    │                 │
+    │ Assign to worker    │                 │
+    │ threads             │                 │
     │ r->used = 2         │                 │
     └──────────┬──────────┘                 │
                │                            │
@@ -550,21 +554,25 @@ ncclResult_t ncclNetSocketTest(void* request, int* done, int* size) {
                               │
                               ▼
                     ┌─────────────────────┐
-                    │ 阶段2：数据传输       │
+                    │ Phase 2: Data       │
+                    │          transfer   │
                     │                     │
-                    │ 有子任务：检查完成   │
-                    │ 无子任务：主线程推进 │
+                    │ Has subtasks: check │
+                    │   completion        │
+                    │ No subtasks: main   │
+                    │   thread progresses │
                     └──────────┬──────────┘
                                │
                                ▼
                     ┌─────────────────────┐
-               ┌────│  全部完成?          │────┐
+               ┌────│  All completed?     │────┐
                │    └─────────────────────┘    │
                │ No                            │ Yes
                ▼                               ▼
-        返回 done=0                    ┌─────────────────┐
-        下次继续                        │ done = 1        │
-                                       │ 回收资源         │
+        Return done=0                  ┌─────────────────┐
+        Continue next time             │ done = 1        │
+                                       │ Reclaim         │
+                                       │ resources       │
                                        │ r->used = 0     │
                                        └─────────────────┘
 ```
@@ -588,14 +596,14 @@ Inline 模式的数据格式：
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  通过 ctrlSock 发送                                   │
+│  Sent via ctrlSock                                   │
 │  ┌───────────────┬────────────────────────────────┐  │
-│  │  size (4B)    │  data (如果 <= 128B)           │  │
+│  │  size (4B)    │  data (if <= 128B)             │  │
 │  └───────────────┴────────────────────────────────┘  │
 │                                                      │
-│  如果 data > 128B：                                  │
+│  If data > 128B:                                     │
 │  ┌───────────────┐                                   │
-│  │  size (4B)    │  只发 size，data 走 socks[]       │
+│  │  size (4B)    │  only send size, data via socks[] │
 │  └───────────────┘                                   │
 └──────────────────────────────────────────────────────┘
 ```
@@ -750,19 +758,19 @@ ncclResult_t ncclNetSocketGetTask(struct ncclNetSocketComm* comm, int op,
 任务分配图示：
 
 ```
-假设 nSocks=4, nThreads=2
+Assuming nSocks=4, nThreads=2
 
-Request: 发送 1MB 数据
+Request: Send 1MB data
      │
      ▼
-拆分成 4 个 Task，每个 256KB
+Split into 4 Tasks, 256KB each
 
 Task[0]: data[0..256K]   ─────►  sock[0]  ─────►  Thread 0
 Task[1]: data[256K..512K] ────►  sock[1]  ─────►  Thread 0
 Task[2]: data[512K..768K] ────►  sock[2]  ─────►  Thread 1
 Task[3]: data[768K..1M]  ─────►  sock[3]  ─────►  Thread 1
 
-每个 Thread 负责 nSocks/nThreads = 2 个 socket
+Each Thread handles nSocks/nThreads = 2 sockets
 ```
 
 ---
@@ -838,24 +846,24 @@ r->nSubs = 4
 ### Step 4: 工作线程并行传输
 
 ```
-Thread 0:                          Thread 1:
-┌──────────────────────┐           ┌──────────────────────┐
-│ 处理 Task[0]         │           │ 处理 Task[2]         │
-│   sock[0].send(0..256KB)│         │   sock[2].send(512KB..768KB)│
-│                      │           │                      │
-│ 处理 Task[1]         │           │ 处理 Task[3]         │
-│   sock[1].send(256KB..512KB)│     │   sock[3].send(768KB..1MB)│
-└──────────────────────┘           └──────────────────────┘
+Thread 0:                                   Thread 1:
+┌───────────────────────────────┐           ┌───────────────────────────────┐
+│ Process Task[0]               │           │ Process Task[2]               │
+│   sock[0].send(0..256KB)      │           │   sock[2].send(512KB..768KB)  │
+│                               │           │                               │
+│ Process Task[1]               │           │ Process Task[3]               │
+│   sock[1].send(256KB..512KB)  │           │   sock[3].send(768KB..1MB)    │
+└───────────────────────────────┘           └───────────────────────────────┘
                 ↓                              ↓
-        ─────────────────────────────────────────────
-                        TCP/IP 网络
-        ─────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────────────
+                      TCP/IP Network
+  ─────────────────────────────────────────────────────────────────────
                 ↓                              ↓
-Thread 0 (recv):                   Thread 1 (recv):
-┌──────────────────────┐           ┌──────────────────────┐
-│ Task[0]: recv 256KB  │           │ Task[2]: recv 256KB  │
-│ Task[1]: recv 256KB  │           │ Task[3]: recv 256KB  │
-└──────────────────────┘           └──────────────────────┘
+Thread 0 (recv):                            Thread 1 (recv):
+┌──────────────────────┐                   ┌──────────────────────┐
+│ Task[0]: recv 256KB  │                   │ Task[2]: recv 256KB  │
+│ Task[1]: recv 256KB  │                   │ Task[3]: recv 256KB  │
+└──────────────────────┘                   └──────────────────────┘
 ```
 
 ### Step 5: test() 检查完成
@@ -881,18 +889,18 @@ if (nCompleted == r->nSubs) {
 ### 完整时序图
 
 ```
-时间 →
+Time →
 
 Rank 0 (sender)                              Rank 1 (receiver)
      │                                              │
      │ isend(1MB)                                   │ irecv(maxSize)
      │ ───────►                                     │ ───────►
      │                                              │
-test │ [used=1] 发送 size=1MB (via ctrlSock)       │ [used=1]
-     │ ─────────────────────────────────────────►  │
-     │                                              │ 接收 size=1MB
+test │ [used=1] send size=1MB (via ctrlSock)        │ [used=1]
+     │ ─────────────────────────────────────────►   │
+     │                                              │ receive size=1MB
      │                                              │
-     │ [used=2] 拆分 4 个 Task                      │ [used=2] 拆分 4 个 Task
+     │ [used=2] split into 4 Tasks                  │ [used=2] split into 4 Tasks
      │ Thread 0: Task[0,1]                          │ Thread 0: Task[0,1]
      │ Thread 1: Task[2,3]                          │ Thread 1: Task[2,3]
      │                                              │
@@ -900,10 +908,10 @@ test │ [used=1] 发送 size=1MB (via ctrlSock)       │ [used=1]
      │ sock[1]: ──────────────────────────────────► │
      │ sock[2]: ──────────────────────────────────► │
      │ sock[3]: ──────────────────────────────────► │
-     │                          并行传输             │
+     │                     parallel transfer        │
      │                                              │
-test │ 检查: nCompleted=4                           │ 检查: nCompleted=4
-     │ done=1, 回收资源                             │ done=1, 回收资源
+test │ check: nCompleted=4                          │ check: nCompleted=4
+     │ done=1, reclaim resources                    │ done=1, reclaim resources
      │                                              │
 ```
 
