@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Read(//root/**)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(done)",
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:developer.nvidia.com)",
+      "WebFetch(domain:github.com)"
     ],
     "deny": [],
     "ask": []
