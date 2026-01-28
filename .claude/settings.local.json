@@ -8,7 +8,9 @@
       "WebSearch",
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:developer.nvidia.com)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "mcp__next-ai-drawio__create_new_diagram",
+      "mcp__next-ai-drawio__export_diagram"
     ],
     "deny": [],
     "ask": []
